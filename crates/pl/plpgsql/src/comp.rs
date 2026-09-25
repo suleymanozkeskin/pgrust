@@ -266,6 +266,7 @@ impl CompState {
                 typoid: std::cell::Cell::new(typoid),
                 tupdesc_id: std::cell::Cell::new(tcache.tupdesc_identifier()),
                 tcache: std::cell::RefCell::new(std::rc::Rc::downgrade(&tcache)),
+                shape: std::cell::RefCell::new(None),
             }))
         } else {
             None
