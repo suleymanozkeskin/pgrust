@@ -704,6 +704,7 @@ fn release_plpgsql_state_at_exit(_code: i32, _arg: usize) {
         spi::SPI_freeplan(plan);
     }
     CALL_TARGETS.with(|t| t.borrow_mut().clear());
+    release_cast_cache();
     release_call_context_pool();
     EXIT_RELEASE_REGISTERED.with(|c| c.set(false));
 }
@@ -808,6 +809,65 @@ struct CastEntry {
     // C cast_lxid: the ExprState is rebuilt each transaction so baked-in
     // domain constraint sets stay fresh (get_cast_hashentry, pl_exec.c:8109).
     lxid: u32,
+    // The compiled state carries EXECUTE decisions for this user; pool
+    // threads serve several users, so a different user rebuilds.
+    userid: Oid,
+    // Owns the coercion tree and the compiled state; declared last so it
+    // drops after `state`.
+    #[allow(dead_code)] // held for ownership and drop order only
+    ctx: Ctx,
+}
+
+impl CastEntry {
+    fn is_current(&self, inval_gen: u64, lxid: u32, userid: Oid) -> bool {
+        self.inval_gen == inval_gen && self.lxid == lxid && self.userid == userid
+    }
+}
+
+type CastKey = (Oid, i32, Oid, i32);
+
+// At most this many cast entries are kept per thread; a full cache first
+// drops its out-of-date entries.
+const MAX_SHARED_CASTS: usize = 256;
+
+std::thread_local! {
+    // Casts of this thread, shared by every call (C shared_cast_hash,
+    // pl_exec.c:143). An entry serves one transaction and user until a
+    // plan-cache invalidation. RefCell per entry: an evaluation holds its
+    // entry, and a recursive use of the same cast builds a private one (C
+    // cast_in_use). Emptied by release_plpgsql_state_at_exit.
+    static CAST_CACHE: core::cell::RefCell<FxHashMap<CastKey, std::rc::Rc<core::cell::RefCell<CastEntry>>>> =
+        core::cell::RefCell::new(FxHashMap::default());
+}
+
+fn release_cast_cache() {
+    let entries: Vec<_> = CAST_CACHE.with(|c| c.borrow_mut().drain().map(|(_, e)| e).collect());
+    drop(entries);
+}
+
+// Keeps `entry` for `key`, making room first when the cache is full. When no
+// room can be made (every entry current or in use), the entry is not kept.
+fn store_cast(key: CastKey, entry: std::rc::Rc<core::cell::RefCell<CastEntry>>, inval_gen: u64, lxid: u32, userid: Oid) {
+    let dropped: Vec<_> = CAST_CACHE.with(|c| {
+        let mut cache = c.borrow_mut();
+        let mut dropped = Vec::new();
+        if cache.len() >= MAX_SHARED_CASTS {
+            let stale: Vec<CastKey> = cache
+                .iter()
+                .filter(|(_, e)| e.try_borrow().is_ok_and(|e| !e.is_current(inval_gen, lxid, userid)))
+                .map(|(k, _)| *k)
+                .collect();
+            for k in stale {
+                dropped.extend(cache.remove(&k));
+            }
+        }
+        if cache.len() < MAX_SHARED_CASTS {
+            dropped.extend(cache.insert(key, entry));
+        }
+        dropped
+    });
+    // Old entries drop outside the cache borrow.
+    drop(dropped);
 }
 
 #[derive(Clone, Copy)]
@@ -834,7 +894,6 @@ pub struct Estate<'a> {
     pub exitlabel: Option<String>,
     pub readonly_func: bool,
     pub atomic: bool,
-    cast_cache: FxHashMap<(Oid, i32, Oid, i32), CastEntry>,
     // Invocation-lifetime var values (C's "procedure" context).
     datum_ctx: Ctx,
     // Per-evaluation scratch (C's eval_mcontext); reset by exec_eval_cleanup.
@@ -1081,7 +1140,6 @@ impl<'a> Estate<'a> {
             exitlabel: None,
             readonly_func,
             atomic,
-            cast_cache: FxHashMap::default(),
             datum_ctx: Ctx::for_call(CallContextKind::Values),
             eval_ctx: Ctx::for_call(CallContextKind::Scratch),
             var_type_overrides: FxHashMap::default(),
@@ -2352,20 +2410,37 @@ impl<'a> Estate<'a> {
         let key = (valtype, valtypmod, reqtype, reqtypmod);
         let cur_gen = plancache::PlanCacheInvalCounter();
         let cur_lxid = current_lxid();
-        let stale = match self.cast_cache.get(&key) {
-            Some(e) => e.inval_gen != cur_gen || e.lxid != cur_lxid,
-            None => true,
+        let userid = miscinit_seams::get_user_id::call();
+        let cached = CAST_CACHE.with(|c| c.borrow().get(&key).cloned());
+        let entry = match cached {
+            Some(e) if e.try_borrow().is_ok_and(|e| e.is_current(cur_gen, cur_lxid, userid)) => e,
+            // In use by an outer evaluation of the same cast (recursion):
+            // evaluate through a private entry, as C does for cast_in_use.
+            Some(e) if e.try_borrow_mut().is_err() => {
+                let mut private = self.build_cast_entry(valtype, valtypmod, reqtype, reqtypmod)?;
+                return self.eval_cast(&mut private, value, isnull);
+            }
+            _ => {
+                let built = self.build_cast_entry(valtype, valtypmod, reqtype, reqtypmod)?;
+                let e = std::rc::Rc::new(core::cell::RefCell::new(built));
+                store_cast(key, e.clone(), cur_gen, cur_lxid, userid);
+                e
+            }
         };
-        if stale {
-            let entry = self.build_cast_entry(valtype, valtypmod, reqtype, reqtypmod)?;
-            self.cast_cache.insert(key, entry);
-        }
-        let entry = self.cast_cache.get_mut(&key).expect("inserted");
-        let Some(state) = entry.state.as_mut() else {
+        let mut entry = entry.borrow_mut();
+        self.eval_cast(&mut entry, value, isnull)
+    }
+
+    // One evaluation of a cast entry; the result is allocated in this call's
+    // eval scratch.
+    fn eval_cast(&self, entry: &mut CastEntry, value: Datum, isnull: &mut bool) -> PgResult<Datum> {
+        let CastEntry { state, param, .. } = entry;
+        let Some(state) = state.as_mut() else {
             return Ok(value);
         };
-        entry.param[0].value = value;
-        entry.param[0].isnull = *isnull;
+        state.arm_result_mcx(self.eval_ctx.mcx());
+        param[0].value = value;
+        param[0].isnull = *isnull;
         let mut slots = execexpr::EvalSlots { scan: None, inner: None, outer: None };
         let r = execexpr::exec_eval_expr(state, &mut slots)?;
         *isnull = r.isnull;
@@ -2391,9 +2466,10 @@ impl<'a> Estate<'a> {
             ptype: srctype,
         }]);
 
-        // The coercion tree is built and compiled in the invocation context
-        // (it lives as long as the cache entry).
-        let mcx = self.datum_ctx.mcx();
+        // The coercion tree is built and compiled in the entry's own
+        // context, which lives as long as the entry.
+        let ctx = Ctx::new("PLpgSQL cast expression");
+        let mcx = ctx.mcx();
         let placeholder = types_nodes::Node::mk(
             mcx,
             Param {
@@ -2465,13 +2541,14 @@ impl<'a> Estate<'a> {
         };
         parser_small1::free_parsestate(pstate)?;
 
+        let userid = miscinit_seams::get_user_id::call();
         let Some(cast_expr) = cast_expr else {
-            return Ok(CastEntry { state: None, param, inval_gen, lxid: current_lxid() });
+            return Ok(CastEntry { state: None, param, inval_gen, lxid: current_lxid(), userid, ctx });
         };
         // No-op relabeling of the bare placeholder: skip evaluation.
         if let Some(r) = cast_expr.as_relabel_type() {
             if r.arg.as_variant::<Param>().is_some() {
-                return Ok(CastEntry { state: None, param, inval_gen, lxid: current_lxid() });
+                return Ok(CastEntry { state: None, param, inval_gen, lxid: current_lxid(), userid, ctx });
             }
         }
 
@@ -2485,11 +2562,10 @@ impl<'a> Estate<'a> {
             n_exec: 0,
             param_callback: None,
         };
-        let Some(mut state) = execexpr::exec_init_expr(mcx, Some(cast_expr), bind)? else {
-            return Ok(CastEntry { state: None, param, inval_gen, lxid: current_lxid() });
+        let Some(state) = execexpr::exec_init_expr(mcx, Some(cast_expr), bind)? else {
+            return Ok(CastEntry { state: None, param, inval_gen, lxid: current_lxid(), userid, ctx });
         };
-        state.arm_result_mcx(self.eval_ctx.mcx());
-        Ok(CastEntry { state: Some(state), param, inval_gen, lxid: current_lxid() })
+        Ok(CastEntry { state: Some(state), param, inval_gen, lxid: current_lxid(), userid, ctx })
     }
 
     // convert_value_to_string: type output function in eval scratch.
@@ -4865,9 +4941,9 @@ impl<'a> Estate<'a> {
     // re-pin arm (CachedPlanIsSimplyValid + expr_simple_plan_lxid,
     // pl_exec.c:6060-6070) without the per-transaction recompile. Cast
     // states stay estate-owned and follow C's cast_lxid revalidation.
-    fn rebuild_simple_exprs(&mut self) {
-        self.cast_cache.clear();
-    }
+    // Cast entries are shared per thread and carry their transaction
+    // (CastEntry::lxid), so nothing is dropped here.
+    fn rebuild_simple_exprs(&mut self) {}
 
     // make_callstmt_target (pl_exec.c:2288): OUT-arg Params -> row varnos,
     // cached per expr like C's stmt->target (function lifetime).
