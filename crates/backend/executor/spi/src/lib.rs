@@ -176,8 +176,10 @@ pub(crate) fn set_spi_tuptable(v: Option<TuptabHandle>) {
     SPI_TUPTABLE.with(|c| c.set(v));
 }
 
-fn leak_ctx(name: &'static str) -> *mut MemoryContext {
-    Box::into_raw(Box::new(MemoryContext::new(name)))
+// C's procCxt is an aset deleted wholesale at SPI_finish; the wholesale reset
+// lets a finished connection's context be reset and reused.
+fn leak_wholesale_ctx(name: &'static str) -> *mut MemoryContext {
+    Box::into_raw(Box::new(MemoryContext::new_wholesale(name)))
 }
 
 // C's execCxt is an aset reset wholesale at _SPI_end_call; parse/param cruft
@@ -203,6 +205,81 @@ fn reset_ctx(ctx: *mut MemoryContext) {
     unsafe { (*ctx).reset() }
 }
 
+// The two contexts of one SPI connection.
+struct ConnectionContexts {
+    proc_cxt: *mut MemoryContext,
+    exec_cxt: *mut MemoryContext,
+}
+
+// Contexts of finished connections, reset, kept for the next SPI_connect on
+// this thread (C: aset.c context_freelists keeps deleted contexts for
+// reuse). Bounded by POOLED_CONNECTIONS; emptied on the backend exit chain.
+struct ContextPool(Vec<ConnectionContexts>);
+
+const POOLED_CONNECTIONS: usize = 8;
+
+impl Drop for ContextPool {
+    // Fallback for a thread that ends without the exit chain (unit tests).
+    fn drop(&mut self) {
+        for contexts in self.0.drain(..) {
+            reclaim_ctx(contexts.exec_cxt);
+            reclaim_ctx(contexts.proc_cxt);
+        }
+    }
+}
+
+thread_local! {
+    static CONTEXT_POOL: RefCell<ContextPool> = const { RefCell::new(ContextPool(Vec::new())) };
+    // Once per process ("process" = one task on this thread: the on_proc_exit
+    // list drains at every exit, so the next task registers again).
+    static POOL_RELEASE_REGISTERED: Cell<bool> = const { Cell::new(false) };
+}
+
+fn take_connection_contexts() -> ConnectionContexts {
+    register_pool_release();
+    let pooled = CONTEXT_POOL.with(|pool| pool.borrow_mut().0.pop());
+    pooled.unwrap_or_else(|| ConnectionContexts {
+        proc_cxt: leak_wholesale_ctx("SPI Proc"),
+        exec_cxt: leak_bump_ctx("SPI Exec"),
+    })
+}
+
+// Resets the contexts and keeps them for reuse, or frees them when the pool
+// is full or the thread's pool is already gone.
+fn give_connection_contexts(contexts: ConnectionContexts) {
+    reset_ctx(contexts.exec_cxt);
+    reset_ctx(contexts.proc_cxt);
+    let mut contexts = Some(contexts);
+    let _ = CONTEXT_POOL.try_with(|pool| {
+        let mut pool = pool.borrow_mut();
+        if pool.0.len() < POOLED_CONNECTIONS {
+            pool.0.push(contexts.take().expect("taken once"));
+        }
+    });
+    if let Some(contexts) = contexts {
+        reclaim_ctx(contexts.exec_cxt);
+        reclaim_ctx(contexts.proc_cxt);
+    }
+}
+
+fn release_context_pool_at_exit(_code: i32, _arg: usize) {
+    let pooled = CONTEXT_POOL.with(|pool| core::mem::take(&mut pool.borrow_mut().0));
+    drop(ContextPool(pooled));
+    POOL_RELEASE_REGISTERED.with(|registered| registered.set(false));
+}
+
+fn register_pool_release() {
+    POOL_RELEASE_REGISTERED.with(|registered| {
+        if !registered.get() {
+            // installed() guard: unit-test rigs run without ipc.
+            if ipc_seams::on_proc_exit::is_installed() {
+                ipc_seams::on_proc_exit::call(release_context_pool_at_exit, 0);
+            }
+            registered.set(true);
+        }
+    });
+}
+
 pub(crate) fn with_current<R>(f: impl FnOnce(&mut SpiConnection) -> R) -> Option<R> {
     SPI_STACK.with(|s| s.borrow_mut().last_mut().map(f))
 }
@@ -213,13 +290,14 @@ pub fn SPI_connect() -> PgResult<i32> {
 
 pub fn SPI_connect_ext(options: i32) -> PgResult<i32> {
     let connect_subid = xact::GetCurrentSubTransactionId();
+    let contexts = take_connection_contexts();
     let conn = SpiConnection {
         processed: 0,
         tuptable: None,
         exec_subid: InvalidSubTransactionId,
         tuptables: Vec::new(),
-        proc_cxt: leak_ctx("SPI Proc"),
-        exec_cxt: leak_bump_ctx("SPI Exec"),
+        proc_cxt: contexts.proc_cxt,
+        exec_cxt: contexts.exec_cxt,
         connect_subid,
         atomic: options & SPI_OPT_NONATOMIC == 0,
         internal_xact: false,
@@ -241,8 +319,7 @@ fn teardown_connection(conn: SpiConnection) {
     plan::free_connection_plans(&conn.plans);
     drop(conn.tuptables);
     queryenvironment::hold::unregister(conn.query_env);
-    reclaim_ctx(conn.exec_cxt);
-    reclaim_ctx(conn.proc_cxt);
+    give_connection_contexts(ConnectionContexts { proc_cxt: conn.proc_cxt, exec_cxt: conn.exec_cxt });
 }
 
 pub fn SPI_finish() -> PgResult<i32> {
