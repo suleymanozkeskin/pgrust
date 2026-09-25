@@ -49,7 +49,7 @@ pub use lookup::{
 pub use path::{
     assign_search_path, check_search_path, fetch_search_path, fetch_search_path_array,
     CopySearchPathMatcher, GetSearchPathMatcher, InitializeSearchPath, SearchPathMatcher,
-    SearchPathMatchesCurrentEnvironment,
+    SearchPathMatchesCurrentEnvironment, SearchPathMatchesSchemas,
 };
 pub use visibility::{
     CollationIsVisible, CollationIsVisibleExt, ConversionIsVisible, ConversionIsVisibleExt,

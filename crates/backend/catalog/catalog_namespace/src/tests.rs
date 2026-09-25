@@ -246,6 +246,30 @@ fn matcher_generation_fast_path() {
     assert!(SearchPathMatchesCurrentEnvironment(&mut zero_gen).unwrap());
 }
 
+#[test]
+fn schemas_match_without_matcher() {
+    install_fakes();
+    set_search_path("public");
+    let ctx = MemoryContext::new("test");
+    let active = GetSearchPathMatcher(ctx.mcx()).unwrap().generation;
+
+    // Fast path: the generation already matches.
+    let mut generation = active;
+    assert!(SearchPathMatchesSchemas(&[NS_PUBLIC], true, false, &mut generation).unwrap());
+    assert_eq!(generation, active);
+
+    // Full comparison with an unknown generation re-stamps it on a match.
+    let mut generation = 0;
+    assert!(SearchPathMatchesSchemas(&[NS_PUBLIC], true, false, &mut generation).unwrap());
+    assert_eq!(generation, active);
+
+    // A different schema list or flag does not match and keeps the generation.
+    let mut generation = 0;
+    assert!(!SearchPathMatchesSchemas(&[NS_S1], true, false, &mut generation).unwrap());
+    assert!(!SearchPathMatchesSchemas(&[NS_PUBLIC], true, true, &mut generation).unwrap());
+    assert_eq!(generation, 0);
+}
+
 // Regression: a session-state swap (as a pooled worker thread does between
 // tasks/sessions) must NOT rewind ACTIVE_PATH_GENERATION. If it did, the same
 // generation value could denote two different search-path states on one thread,

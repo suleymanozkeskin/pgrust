@@ -111,21 +111,19 @@ fn capture_search_path() -> PgResult<Rc<PathFingerprint>> {
 }
 
 // plancache.c SearchPathMatchesCurrentEnvironment against a cached entry's
-// fingerprint. Rebuilds an mcx-bound matcher from the owned copy, compares, and
-// re-stamps the generation on a match so the next lookup takes the fast path.
+// fingerprint. Compares the owned schema list directly (no memory context, no
+// copy) and re-stamps the generation on a match so the next lookup takes the
+// fast path.
 fn search_path_still_matches(fp: &PathFingerprint) -> PgResult<bool> {
-    let cx = mcx::MemoryContext::new("plpgsql search_path recheck");
-    let mut schemas = mcx::vec_with_capacity_in(cx.mcx(), fp.schemas.len())?;
-    schemas.extend_from_slice(&fp.schemas);
-    let mut matcher = catalog_namespace::SearchPathMatcher {
-        schemas,
-        addCatalog: fp.add_catalog,
-        addTemp: fp.add_temp,
-        generation: fp.generation.get(),
-    };
-    let matches = catalog_namespace::SearchPathMatchesCurrentEnvironment(&mut matcher)?;
+    let mut generation = fp.generation.get();
+    let matches = catalog_namespace::SearchPathMatchesSchemas(
+        &fp.schemas,
+        fp.add_catalog,
+        fp.add_temp,
+        &mut generation,
+    )?;
     if matches {
-        fp.generation.set(matcher.generation);
+        fp.generation.set(generation);
     }
     Ok(matches)
 }
