@@ -1,0 +1,132 @@
+--
+-- Rows returned by PL/pgSQL row triggers: NEW or OLD returned unchanged,
+-- changed, or replaced; large values; generated columns; a table whose
+-- columns change between calls; one function on two tables.
+--
+CREATE TABLE ptr_t (
+    id integer PRIMARY KEY,
+    a text,
+    b text,
+    n numeric,
+    g integer GENERATED ALWAYS AS (id * 10) STORED
+);
+ALTER TABLE ptr_t ALTER COLUMN b SET STORAGE EXTERNAL;
+CREATE FUNCTION ptr_before() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        IF OLD.a = 'keep' THEN
+            RETURN NULL;
+        END IF;
+        RETURN OLD;
+    END IF;
+    IF NEW.a = 'change' THEN
+        NEW.a := 'changed';
+        NEW.n := coalesce(NEW.n, 0) + 1;
+    ELSIF NEW.a = 'old' AND TG_OP = 'UPDATE' THEN
+        RETURN OLD;
+    ELSIF NEW.a = 'replace' THEN
+        SELECT * INTO NEW FROM ptr_t WHERE id = 1;
+        NEW.id := 99;
+    END IF;
+    RETURN NEW;
+END $$;
+CREATE TRIGGER ptr_before BEFORE INSERT OR UPDATE OR DELETE ON ptr_t
+    FOR EACH ROW EXECUTE FUNCTION ptr_before();
+INSERT INTO ptr_t (id, a, b, n) VALUES
+    (1, 'plain', 'small-b', 1.5),
+    (2, 'change', 'b2', NULL),
+    (3, 'plain', repeat('x', 3000), 3),
+    (4, 'plain', NULL, NULL),
+    (5, 'keep', 'b5', 5);
+INSERT INTO ptr_t (id, a, b) VALUES (6, 'replace', 'ignored');
+SELECT id, a, left(b, 10), length(b), n, g FROM ptr_t ORDER BY id;
+ id |    a    |    left    | length |  n  |  g  
+----+---------+------------+--------+-----+-----
+  1 | plain   | small-b    |      7 | 1.5 |  10
+  2 | changed | b2         |      2 |   1 |  20
+  3 | plain   | xxxxxxxxxx |   3000 |   3 |  30
+  4 | plain   |            |        |     |  40
+  5 | keep    | b5         |      2 |   5 |  50
+ 99 | plain   | small-b    |      7 | 1.5 | 990
+(6 rows)
+
+UPDATE ptr_t SET n = 10 WHERE id = 1;
+UPDATE ptr_t SET a = 'old', n = 20 WHERE id = 4;
+UPDATE ptr_t SET a = 'change' WHERE id = 3;
+UPDATE ptr_t SET b = repeat('y', 4000) WHERE id = 1;
+DELETE FROM ptr_t WHERE id IN (5, 99);
+SELECT id, a, left(b, 10), length(b), n, g FROM ptr_t ORDER BY id;
+ id |    a    |    left    | length | n  | g  
+----+---------+------------+--------+----+----
+  1 | plain   | yyyyyyyyyy |   4000 | 10 | 10
+  2 | changed | b2         |      2 |  1 | 20
+  3 | changed | xxxxxxxxxx |   3000 |  4 | 30
+  4 | plain   |            |        |    | 40
+  5 | keep    | b5         |      2 |  5 | 50
+(5 rows)
+
+-- The table changes between calls of the same trigger function.
+ALTER TABLE ptr_t ADD COLUMN extra text DEFAULT 'dflt';
+INSERT INTO ptr_t (id, a, b) VALUES (7, 'plain', 'b7');
+ALTER TABLE ptr_t DROP COLUMN n;
+INSERT INTO ptr_t (id, a, b, extra) VALUES (8, 'change', 'b8', 'e8');
+ERROR:  record "new" has no field "n"
+CONTEXT:  PL/pgSQL function ptr_before() line 11 at assignment
+ALTER TABLE ptr_t RENAME COLUMN a TO a_renamed;
+CREATE OR REPLACE FUNCTION ptr_before() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        RETURN OLD;
+    END IF;
+    IF NEW.a_renamed = 'change' THEN
+        NEW.a_renamed := 'changed-again';
+    END IF;
+    RETURN NEW;
+END $$;
+INSERT INTO ptr_t (id, a_renamed, b) VALUES (9, 'change', 'b9'), (10, 'plain', 'b10');
+UPDATE ptr_t SET extra = 'upd' WHERE id IN (7, 8);
+SELECT id, a_renamed, left(b, 10), g, extra FROM ptr_t ORDER BY id;
+ id |   a_renamed   |    left    |  g  | extra 
+----+---------------+------------+-----+-------
+  1 | plain         | yyyyyyyyyy |  10 | dflt
+  2 | changed       | b2         |  20 | dflt
+  3 | changed       | xxxxxxxxxx |  30 | dflt
+  4 | plain         |            |  40 | dflt
+  5 | keep          | b5         |  50 | dflt
+  7 | plain         | b7         |  70 | upd
+  9 | changed-again | b9         |  90 | dflt
+ 10 | plain         | b10        | 100 | dflt
+(8 rows)
+
+-- One function on two tables with different row types.
+CREATE TABLE ptr_u (k text, v integer);
+CREATE FUNCTION ptr_stamp() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF TG_TABLE_NAME = 'ptr_u' THEN
+        IF NEW.v < 0 THEN
+            NEW.v := 0;
+        END IF;
+    END IF;
+    RETURN NEW;
+END $$;
+CREATE TRIGGER ptr_stamp_t BEFORE INSERT ON ptr_t FOR EACH ROW EXECUTE FUNCTION ptr_stamp();
+CREATE TRIGGER ptr_stamp_u BEFORE INSERT ON ptr_u FOR EACH ROW EXECUTE FUNCTION ptr_stamp();
+INSERT INTO ptr_u VALUES ('a', 1), ('b', -5);
+INSERT INTO ptr_t (id, a_renamed, b) VALUES (11, 'plain', 'b11');
+INSERT INTO ptr_u VALUES ('c', 3);
+SELECT * FROM ptr_u ORDER BY k;
+ k | v 
+---+---
+ a | 1
+ b | 0
+ c | 3
+(3 rows)
+
+SELECT id, a_renamed, b, g, extra FROM ptr_t WHERE id = 11;
+ id | a_renamed |  b  |  g  | extra 
+----+-----------+-----+-----+-------
+ 11 | plain     | b11 | 110 | dflt
+(1 row)
+
+DROP TABLE ptr_t, ptr_u;
+DROP FUNCTION ptr_before(), ptr_stamp();
