@@ -170,6 +170,30 @@ impl RecDesc {
     }
 }
 
+// Type, typmod and dropped flag of one source column: all that a
+// scalar-list assignment reads from the source row's descriptor.
+#[derive(Clone, Copy)]
+struct SourceColumn {
+    typid: Oid,
+    typmod: i32,
+    dropped: bool,
+}
+
+impl SourceColumn {
+    // Initial value of workspace slots; every slot is overwritten before use.
+    const UNSET: SourceColumn = SourceColumn { typid: types_core::InvalidOid, typmod: -1, dropped: true };
+
+    fn of_rec_desc(desc: &RecDesc) -> Vec<SourceColumn> {
+        (0..desc.types.len())
+            .map(|f| SourceColumn {
+                typid: desc.types[f],
+                typmod: desc.typmods[f],
+                dropped: desc.dropped[f],
+            })
+            .collect()
+    }
+}
+
 // The heap tuple a record was bound from (C's expanded record fvalue, kept
 // across field assignments); absent for a record built from fields.
 #[derive(Clone, Copy)]
@@ -3315,18 +3339,21 @@ impl<'a> Estate<'a> {
     ) -> PgResult<()> {
         match &self.func.datums[target as usize] {
             PlDatum::Var(v) => {
-                let (reqtype, reqtypmod, typlen, typbyval, typisarray, notnull, refname) = (
+                let (reqtype, reqtypmod, typlen, typbyval, typisarray, notnull) = (
                     v.datatype.typoid,
                     v.datatype.atttypmod,
                     v.datatype.typlen,
                     v.datatype.typbyval,
                     v.datatype.typisarray,
                     v.notnull,
-                    v.refname.clone(),
                 );
                 let newvalue =
                     self.exec_cast_value(value, &mut isnull, valtype, valtypmod, reqtype, reqtypmod)?;
                 if isnull && notnull {
+                    let PlDatum::Var(v) = &self.func.datums[target as usize] else {
+                        unreachable!("plpgsql exec_assign_value: datum {target} changed kind");
+                    };
+                    let refname = &v.refname;
                     return Err(exec_err(
                         types_error::ERRCODE_NULL_VALUE_NOT_ALLOWED,
                         format!(
@@ -3501,7 +3528,8 @@ impl<'a> Estate<'a> {
                 // (pl_exec.c:7796, 7181-7330): the ROW arm, including the
                 // strict_multi_assignment check.
                 let (desc, _src, values, nulls, _) = self.deconstruct_composite(value)?;
-                self.move_row_fields_into_varnos(&varnos, &desc, |anum| (values[anum], nulls[anum]))
+                let columns = SourceColumn::of_rec_desc(&desc);
+                self.move_row_fields_into_varnos(&varnos, &columns, |anum| (values[anum], nulls[anum]))
             }
         }
     }
@@ -4890,22 +4918,40 @@ impl<'a> Estate<'a> {
         tuptab: TuptabHandle,
         i: usize,
     ) -> PgResult<()> {
-        let (desc, _src) = self.rec_desc_of(tuptab)?;
-        let natts = desc.types.len();
+        let natts = spi::tuptable_with(tuptab, |t| t.tupdesc.attrs.len());
         // Narrow rows (the common scalar-list case) deform into stack arrays.
         let mut inline_values = [Datum::null(); INLINE_ROW_FIELDS];
         let mut inline_nulls = [true; INLINE_ROW_FIELDS];
+        let mut inline_columns = [SourceColumn::UNSET; INLINE_ROW_FIELDS];
         let mut heap_values;
         let mut heap_nulls;
-        let (values, nulls): (&mut [Datum], &mut [bool]) = if natts <= INLINE_ROW_FIELDS {
-            (&mut inline_values[..natts], &mut inline_nulls[..natts])
-        } else {
-            heap_values = vec![Datum::null(); natts];
-            heap_nulls = vec![true; natts];
-            (&mut heap_values[..], &mut heap_nulls[..])
-        };
-        spi::tuptable_with(tuptab, |t| deform_tuptable_row(t, i, values, nulls));
-        self.move_row_fields_into_varnos(varnos, &desc, |anum| (values[anum], nulls[anum]))
+        let mut heap_columns;
+        let (values, nulls, columns): (&mut [Datum], &mut [bool], &mut [SourceColumn]) =
+            if natts <= INLINE_ROW_FIELDS {
+                (
+                    &mut inline_values[..natts],
+                    &mut inline_nulls[..natts],
+                    &mut inline_columns[..natts],
+                )
+            } else {
+                heap_values = vec![Datum::null(); natts];
+                heap_nulls = vec![true; natts];
+                heap_columns = vec![SourceColumn::UNSET; natts];
+                (&mut heap_values[..], &mut heap_nulls[..], &mut heap_columns[..])
+            };
+        // The column types are read from the result descriptor in place; the
+        // descriptor is not copied.
+        spi::tuptable_with(tuptab, |t| {
+            for (column, a) in columns.iter_mut().zip(t.tupdesc.attrs.iter()) {
+                *column = SourceColumn {
+                    typid: a.atttypid,
+                    typmod: a.atttypmod,
+                    dropped: a.attisdropped,
+                };
+            }
+            deform_tuptable_row(t, i, values, nulls)
+        });
+        self.move_row_fields_into_varnos(varnos, columns, |anum| (values[anum], nulls[anum]))
     }
 
     // exec_move_row_from_fields' ROW arm (pl_exec.c:7181-7330) over an
@@ -4916,20 +4962,20 @@ impl<'a> Estate<'a> {
     fn move_row_fields_into_varnos(
         &mut self,
         varnos: &[Dno],
-        desc: &RecDesc,
+        columns: &[SourceColumn],
         mut fetch: impl FnMut(usize) -> (Datum, bool),
     ) -> PgResult<()> {
-        let natts = desc.types.len();
+        let natts = columns.len();
         let sma_level =
             crate::handler::extra_checks_level(crate::comp::XCHECK_STRICTMULTIASSIGNMENT)?;
         let mut anum = 0usize;
         for &dno in varnos {
-            while anum < natts && desc.dropped[anum] {
+            while anum < natts && columns[anum].dropped {
                 anum += 1;
             }
             let (v, isnull, vt, vm) = if anum < natts {
                 let (v, isnull) = fetch(anum);
-                let r = (v, isnull, desc.types[anum], desc.typmods[anum]);
+                let r = (v, isnull, columns[anum].typid, columns[anum].typmod);
                 anum += 1;
                 r
             } else {
@@ -4941,7 +4987,7 @@ impl<'a> Estate<'a> {
             self.exec_assign_value(dno, v, isnull, vt, vm)?;
         }
         if let Some(level) = sma_level {
-            while anum < natts && desc.dropped[anum] {
+            while anum < natts && columns[anum].dropped {
                 anum += 1;
             }
             if anum < natts {
