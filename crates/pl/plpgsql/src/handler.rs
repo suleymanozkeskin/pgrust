@@ -1599,6 +1599,7 @@ fn coerce_function_result_tuple(
             let (desc, src, values, nulls, _) = estate.deconstruct_composite(retval)?;
             crate::exec::RecValue {
                 owned: vec![false; values.len()],
+                tuple_copy: None,
                 desc: std::rc::Rc::new(desc),
                 values,
                 nulls,
@@ -1845,17 +1846,10 @@ fn bind_trigger_tuple(
     types_tuple::heap_deform_tuple(t, tupdesc, &mut rv.values, &mut rv.nulls);
     rv.sys = Some(Rc::new(crate::exec::RecSysAttrs::from_tuple(t)));
     rv.fvalue_valid = true;
-    for i in 0..natts {
-        if !rv.desc.dropped[i] {
-            rv.values[i] = estate.copy_to_datum_ctx(
-                rv.values[i],
-                rv.nulls[i],
-                rv.desc.typlens[i],
-                rv.desc.typbyvals[i],
-            )?;
-            rv.owned[i] = !rv.nulls[i] && !rv.desc.typbyvals[i];
-        }
-    }
+    debug_assert!(rv.tuple_copy.is_none(), "trigger record bound twice");
+    debug_assert_eq!(natts, rv.values.len());
+    let desc = rv.desc.clone();
+    rv.tuple_copy = estate.copy_row_values(t, &desc, &mut rv.values, &rv.nulls, &mut rv.owned)?;
     Ok(())
 }
 
@@ -1953,6 +1947,7 @@ fn plpgsql_exec_trigger(
         sys: None,
         fvalue_valid: false,
         owned: vec![false; natts],
+        tuple_copy: None,
     };
     let mut new_rv = empty_rv.clone();
     let mut old_rv = empty_rv;
@@ -2039,6 +2034,7 @@ fn plpgsql_exec_trigger(
             };
             crate::exec::RecValue {
                 owned: vec![false; values.len()],
+                tuple_copy: None,
                 desc: std::rc::Rc::new(d),
                 values,
                 nulls,
@@ -2222,6 +2218,7 @@ mod tests {
                 values: vec![Datum::from_i32(42), Datum::from_i32(43)],
                 nulls: vec![false, false],
                 owned: vec![false, false],
+                tuple_copy: None,
                 src_desc: Some(Rc::new(returned)),
                 empty: false,
                 sys: None,

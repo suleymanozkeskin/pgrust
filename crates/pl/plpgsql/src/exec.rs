@@ -140,6 +140,9 @@ pub struct RecDesc {
     pub typbyvals: Vec<bool>,
     pub colls: Vec<Oid>,
     pub dropped: Vec<bool>,
+    // Columns that are neither dropped nor by-value: the fields a row
+    // assignment may have to copy.
+    pub by_ref_columns: usize,
 }
 
 impl RecDesc {
@@ -153,6 +156,7 @@ impl RecDesc {
             typbyvals: Vec::with_capacity(natts),
             colls: Vec::with_capacity(natts),
             dropped: Vec::with_capacity(natts),
+            by_ref_columns: 0,
         };
         for a in td.attrs.iter() {
             // attname as stored: expanded_record_lookup_field compares the
@@ -165,6 +169,9 @@ impl RecDesc {
             d.typbyvals.push(a.attbyval);
             d.colls.push(a.attcollation);
             d.dropped.push(a.attisdropped);
+            if !a.attisdropped && !a.attbyval {
+                d.by_ref_columns += 1;
+            }
         }
         d
     }
@@ -322,6 +329,46 @@ pub struct RecValue {
     /// value if it is not part of the tuple". False for values that point
     /// into a caller-owned tuple or image.
     pub owned: Vec<bool>,
+    /// The copy of the source tuple that fields with `owned` false may point
+    /// into (C: the expanded record's flat tuple); freed with the record's
+    /// fields. None for a clone or when fields were copied one by one.
+    pub tuple_copy: Option<TupleCopy>,
+}
+
+// A row assignment copies the whole source tuple only when the row type has at
+// least this many by-ref columns; below it, one allocation per field is as
+// cheap.
+const TUPLE_COPY_MIN_FIELDS: usize = 2;
+
+// One copy of a source tuple's bytes in the invocation's datum context.
+pub struct TupleCopy {
+    ptr: core::ptr::NonNull<u8>,
+    len: usize,
+}
+
+impl TupleCopy {
+    fn layout(len: usize) -> core::alloc::Layout {
+        core::alloc::Layout::from_size_align(len, 8).expect("tuple copy layout")
+    }
+
+    // Copies `t`'s header and data (t_len bytes) into `mcx`.
+    fn of(mcx: Mcx<'static>, t: &types_tuple::HeapTupleData<'_>) -> PgResult<TupleCopy> {
+        let len = t.t_len as usize;
+        let ptr = mcx::Allocator::allocate(&mcx, Self::layout(len))
+            .map_err(|_| Box::new(mcx.oom(len)))?
+            .cast::<u8>();
+        // SAFETY: t's image is readable for t_len bytes; the new allocation
+        // has exactly that size and does not overlap it.
+        unsafe { core::ptr::copy_nonoverlapping(t.header_ptr(), ptr.as_ptr(), len) };
+        Ok(TupleCopy { ptr, len })
+    }
+
+    // SAFETY: `self` was made by TupleCopy::of in `mcx`, and no field that
+    // points into it is read afterwards.
+    unsafe fn free(self, mcx: Mcx<'static>) {
+        // SAFETY: forwarded caller contract.
+        unsafe { mcx::Allocator::deallocate(&mcx, self.ptr, Self::layout(self.len)) };
+    }
 }
 
 impl Clone for RecValue {
@@ -338,6 +385,7 @@ impl Clone for RecValue {
             sys: self.sys.clone(),
             fvalue_valid: self.fvalue_valid,
             owned: vec![false; self.values.len()],
+            tuple_copy: None,
         }
     }
 }
@@ -1155,6 +1203,54 @@ impl<'a> Estate<'a> {
                 rv.owned[f] = false;
             }
         }
+        if let Some(copy) = rv.tuple_copy.take() {
+            // SAFETY: made by TupleCopy::of in datum_ctx for this record; its
+            // fields are being released with it.
+            unsafe { copy.free(mcx) };
+        }
+    }
+
+    // expanded_record_set_tuple's copy for fields deformed from `t`: the tuple
+    // is copied once and each by-ref field inside it is moved onto the copy
+    // (owned false); a by-ref field outside it (a missing-attribute default
+    // from the descriptor) gets its own copy (owned true). The fields are
+    // copied one by one instead, and the result is None, when the row type
+    // has fewer than TUPLE_COPY_MIN_FIELDS by-ref columns (one allocation
+    // either way),
+    // or when a non-atomic context holds a tuple with external values (they
+    // must be detoasted, as C's toast_flatten_tuple does).
+    pub(crate) fn copy_row_values(
+        &self,
+        t: &types_tuple::HeapTupleData<'_>,
+        desc: &RecDesc,
+        values: &mut [Datum],
+        nulls: &[bool],
+        owned: &mut [bool],
+    ) -> PgResult<Option<TupleCopy>> {
+        let whole = desc.by_ref_columns >= TUPLE_COPY_MIN_FIELDS && (self.atomic || !t.has_external());
+        let copy = match whole {
+            true => Some(TupleCopy::of(self.datum_ctx.mcx(), t)?),
+            false => None,
+        };
+        let base = t.header_ptr() as usize;
+        for f in 0..values.len() {
+            if desc.dropped[f] || nulls[f] || desc.typbyvals[f] {
+                continue;
+            }
+            let p = values[f].as_usize();
+            match &copy {
+                Some(copy) if p >= base && p < base + copy.len => {
+                    values[f] = Datum::from_usize(copy.ptr.as_ptr() as usize + (p - base));
+                    owned[f] = false;
+                }
+                _ => {
+                    values[f] =
+                        self.assign_copy_to_datum_ctx(values[f], false, desc.typlens[f], false)?;
+                    owned[f] = true;
+                }
+            }
+        }
+        Ok(copy)
     }
 
     // exec_eval_cleanup.
@@ -1743,6 +1839,7 @@ impl<'a> Estate<'a> {
                 sys: None,
                 fvalue_valid: false,
                 owned: vec![false; n],
+                tuple_copy: None,
             }),
         );
         Ok(())
@@ -3844,27 +3941,16 @@ impl<'a> Estate<'a> {
         };
         let mut values = vec![Datum::null(); natts];
         let mut nulls = vec![true; natts];
-        let sys = spi::tuptable_with(tuptab, |t| {
-            deform_tuptable_row(t, i, &mut values, &mut nulls);
-            std::rc::Rc::new(RecSysAttrs::from_tuple(&t.vals[i]))
-        });
         let mut owned = vec![false; natts];
-        {
-            let DatumVal::Rec(Some(rv)) = &self.datums[recno as usize] else {
-                unreachable!("checked above")
-            };
-            for f in 0..natts {
-                if !rv.desc.dropped[f] {
-                    values[f] = self.assign_copy_to_datum_ctx(
-                        values[f],
-                        nulls[f],
-                        rv.desc.typlens[f],
-                        rv.desc.typbyvals[f],
-                    )?;
-                    owned[f] = !nulls[f] && !rv.desc.typbyvals[f];
-                }
-            }
-        }
+        let desc = match &self.datums[recno as usize] {
+            DatumVal::Rec(Some(rv)) => rv.desc.clone(),
+            _ => unreachable!("checked above"),
+        };
+        let (sys, tuple_copy) = spi::tuptable_with(tuptab, |t| {
+            deform_tuptable_row(t, i, &mut values, &mut nulls);
+            let tuple_copy = self.copy_row_values(&t.vals[i], &desc, &mut values, &nulls, &mut owned)?;
+            PgResult::Ok((std::rc::Rc::new(RecSysAttrs::from_tuple(&t.vals[i])), tuple_copy))
+        })?;
         // check_domain_for_new_tuple: the prospective fields must satisfy
         // a composite domain before they replace the current ones.
         let rectypeid = self.rec_typeid(recno);
@@ -3877,13 +3963,15 @@ impl<'a> Estate<'a> {
             };
             if let Err(e) = self.rec_domain_check_fields(rectypeid, &td, &values, &nulls) {
                 let mcx = self.datum_ctx.mcx();
-                if let DatumVal::Rec(Some(rv)) = &self.datums[recno as usize] {
-                    for f in 0..natts {
-                        if owned[f] {
-                            // SAFETY: fresh copies above, held by nobody.
-                            unsafe { free_datum_copy(mcx, values[f], rv.desc.typlens[f]) };
-                        }
+                for f in 0..natts {
+                    if owned[f] {
+                        // SAFETY: fresh copies above, held by nobody.
+                        unsafe { free_datum_copy(mcx, values[f], desc.typlens[f]) };
                     }
+                }
+                if let Some(copy) = tuple_copy {
+                    // SAFETY: made above in datum_ctx; its fields are dropped here.
+                    unsafe { copy.free(mcx) };
                 }
                 return Err(e);
             }
@@ -3897,9 +3985,15 @@ impl<'a> Estate<'a> {
                     unsafe { free_datum_copy(mcx, rv.values[f], rv.desc.typlens[f]) };
                 }
             }
+            if let Some(copy) = rv.tuple_copy.take() {
+                // SAFETY: the record's previous tuple copy; its fields are
+                // replaced below.
+                unsafe { copy.free(mcx) };
+            }
             rv.values = values;
             rv.nulls = nulls;
             rv.owned = owned;
+            rv.tuple_copy = tuple_copy;
             rv.sys = Some(sys);
             rv.fvalue_valid = true;
             rv.empty = false;
@@ -4003,40 +4097,46 @@ impl<'a> Estate<'a> {
         shape: DeclaredShape,
     ) -> PgResult<RowMove> {
         let rectypeid = self.rec_typeid(recno);
-        let natts = shape.desc.types.len();
+        let desc = shape.desc;
+        let natts = desc.types.len();
         let mut values = vec![Datum::null(); natts];
         let mut nulls = vec![true; natts];
-        let sys = spi::tuptable_with(tuptab, |t| {
-            if rectypeid == t.tupdesc.tdtypeid || compatible_tupdescs(&t.tupdesc, &shape.tupdesc) {
-                deform_tuptable_row(t, i, &mut values, &mut nulls);
-                Some(std::rc::Rc::new(RecSysAttrs::from_tuple(&t.vals[i])))
-            } else {
-                None
+        let mut owned = vec![false; natts];
+        let stored = spi::tuptable_with(tuptab, |t| {
+            if rectypeid != t.tupdesc.tdtypeid && !compatible_tupdescs(&t.tupdesc, &shape.tupdesc) {
+                return PgResult::Ok(None);
             }
-        });
-        let Some(sys) = sys else {
+            deform_tuptable_row(t, i, &mut values, &mut nulls);
+            for f in 0..natts {
+                if desc.dropped[f] {
+                    values[f] = Datum::null();
+                    nulls[f] = true;
+                }
+            }
+            let tuple_copy = self.copy_row_values(&t.vals[i], &desc, &mut values, &nulls, &mut owned)?;
+            Ok(Some((std::rc::Rc::new(RecSysAttrs::from_tuple(&t.vals[i])), tuple_copy)))
+        })?;
+        let Some((sys, tuple_copy)) = stored else {
             return Ok(RowMove::NeedsCoercion);
         };
-        let desc = shape.desc;
-        for f in 0..natts {
-            if desc.dropped[f] {
-                values[f] = Datum::null();
-                nulls[f] = true;
-            }
-        }
-        // Domain check BEFORE committing, as in move_rec_from_values.
+        // Domain check BEFORE committing, as in move_rec_from_values; a
+        // violation frees the new copies and keeps the old value.
         if Self::rec_base_typeid(rectypeid)? != rectypeid {
-            self.rec_domain_check_fields(rectypeid, &shape.tupdesc, &values, &nulls)?;
-        }
-        for f in 0..natts {
-            if !desc.dropped[f] {
-                values[f] =
-                    self.assign_copy_to_datum_ctx(values[f], nulls[f], desc.typlens[f], desc.typbyvals[f])?;
+            if let Err(e) = self.rec_domain_check_fields(rectypeid, &shape.tupdesc, &values, &nulls) {
+                let mcx = self.datum_ctx.mcx();
+                for f in 0..natts {
+                    if owned[f] {
+                        // SAFETY: fresh copies above, held by nobody.
+                        unsafe { free_datum_copy(mcx, values[f], desc.typlens[f]) };
+                    }
+                }
+                if let Some(copy) = tuple_copy {
+                    // SAFETY: made above in datum_ctx; its fields are dropped here.
+                    unsafe { copy.free(mcx) };
+                }
+                return Err(e);
             }
         }
-        let owned = (0..natts)
-            .map(|f| !desc.dropped[f] && !nulls[f] && !desc.typbyvals[f])
-            .collect();
         self.assign_record_var(
             recno,
             Some(RecValue {
@@ -4048,6 +4148,7 @@ impl<'a> Estate<'a> {
                 fvalue_valid: true,
                 sys: Some(sys),
                 owned,
+                tuple_copy,
             }),
         );
         Ok(RowMove::Stored)
@@ -4058,6 +4159,9 @@ impl<'a> Estate<'a> {
     // move_rec_from_values.
     fn move_rec_from_tuptable_fields(&mut self, var: Dno, tuptab: TuptabHandle, i: usize) -> PgResult<()> {
         let (desc, src_desc) = self.rec_desc_of(tuptab)?;
+        if self.rec_typeid(var) == RECORDOID {
+            return self.store_record_row(var, tuptab, i, desc, src_desc);
+        }
         let natts = desc.types.len();
         let mut values = vec![Datum::null(); natts];
         let mut nulls = vec![true; natts];
@@ -4066,6 +4170,43 @@ impl<'a> Estate<'a> {
             std::rc::Rc::new(RecSysAttrs::from_tuple(&t.vals[i]))
         });
         self.move_rec_from_values(var, &desc, src_desc, &values, &nulls, Some(sys), true, true)
+    }
+
+    // The RECORD arm of move_rec_from_values for row `i` of a tuple table: the
+    // record adopts the source shape and the row is stored with one tuple
+    // copy (copy_row_values).
+    fn store_record_row(
+        &mut self,
+        var: Dno,
+        tuptab: TuptabHandle,
+        i: usize,
+        desc: std::rc::Rc<RecDesc>,
+        src_desc: std::rc::Rc<types_tuple::TupleDescData<'static>>,
+    ) -> PgResult<()> {
+        let natts = desc.types.len();
+        let mut values = vec![Datum::null(); natts];
+        let mut nulls = vec![true; natts];
+        let mut owned = vec![false; natts];
+        let (sys, tuple_copy) = spi::tuptable_with(tuptab, |t| {
+            deform_tuptable_row(t, i, &mut values, &mut nulls);
+            let tuple_copy = self.copy_row_values(&t.vals[i], &desc, &mut values, &nulls, &mut owned)?;
+            PgResult::Ok((std::rc::Rc::new(RecSysAttrs::from_tuple(&t.vals[i])), tuple_copy))
+        })?;
+        self.assign_record_var(
+            var,
+            Some(RecValue {
+                desc,
+                values,
+                nulls,
+                src_desc: Some(src_desc),
+                empty: false,
+                fvalue_valid: true,
+                sys: Some(sys),
+                owned,
+                tuple_copy,
+            }),
+        );
+        Ok(())
     }
 
     // The strict_multi_assignment report (pl_exec.c:7286-7297); Err only at
@@ -4136,6 +4277,7 @@ impl<'a> Estate<'a> {
                     fvalue_valid: sys.is_some(),
                     sys,
                     owned,
+                    tuple_copy: None,
                 }),
             );
             return Ok(());
@@ -4235,6 +4377,7 @@ impl<'a> Estate<'a> {
                 fvalue_valid: sys.is_some(),
                 sys,
                 owned,
+                tuple_copy: None,
             }),
         );
         Ok(())
@@ -4291,6 +4434,7 @@ impl<'a> Estate<'a> {
             sys: None,
             fvalue_valid: false,
             owned,
+            tuple_copy: None,
         })
     }
 
@@ -6337,6 +6481,7 @@ pub(crate) mod cfi_tests {
             values: vec![Datum::from_i32(7)],
             nulls: vec![false],
             owned: vec![false],
+            tuple_copy: None,
             src_desc: Some(std::rc::Rc::new(tupdesc::CreateTupleDescCopy(mcx, &td).unwrap())),
             empty: false,
             fvalue_valid: sys.is_some(),
@@ -6400,6 +6545,7 @@ pub(crate) mod cfi_tests {
             values: vec![Datum::from_i32(7)],
             nulls: vec![false],
             owned: vec![false],
+            tuple_copy: None,
             src_desc: Some(std::rc::Rc::new(tupdesc::CreateTupleDescCopy(mcx, &td).unwrap())),
             empty: false,
             sys: Some(std::rc::Rc::new(RecSysAttrs::from_tuple(&tup))),
