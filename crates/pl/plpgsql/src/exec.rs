@@ -71,6 +71,33 @@ const TYPTYPE_DOMAIN: i8 = b'd' as i8;
 const CURSOR_OPT_NO_SCROLL: i32 = 0x0004;
 const CURSOR_OPT_PARALLEL_OK: i32 = 0x0800;
 
+// Rows up to this many fields are deformed into stack arrays on the
+// scalar-list assignment path (move_row_into_varnos).
+const INLINE_ROW_FIELDS: usize = 8;
+
+// exec_move_row (pl_exec.c): deform row `i` of an SPI tuple table once
+// (heap_deform_tuple) instead of one heap_getattr walk per field. Fills
+// `values`/`nulls` positionally up to their length; positions past the source
+// descriptor stay NULL, as SPI_getbinval returns for them (SPI_ERROR_NOATTRIBUTE).
+// The datums point into the tuple table's row, as SPI_getbinval's do.
+fn deform_tuptable_row(t: &spi::TuptabData<'_>, i: usize, values: &mut [Datum], nulls: &mut [bool]) {
+    let src_natts = t.tupdesc.natts.max(0) as usize;
+    if values.len() == src_natts {
+        types_tuple::heap_deform_tuple(&t.vals[i], &t.tupdesc, values, nulls);
+        return;
+    }
+    let mut src_values = vec![Datum::null(); src_natts];
+    let mut src_nulls = vec![true; src_natts];
+    types_tuple::heap_deform_tuple(&t.vals[i], &t.tupdesc, &mut src_values, &mut src_nulls);
+    let n = values.len().min(src_natts);
+    values[..n].copy_from_slice(&src_values[..n]);
+    nulls[..n].copy_from_slice(&src_nulls[..n]);
+    for f in n..values.len() {
+        values[f] = Datum::null();
+        nulls[f] = true;
+    }
+}
+
 pub(crate) struct Ctx(*mut MemoryContext);
 
 impl Ctx {
@@ -3748,11 +3775,7 @@ impl<'a> Estate<'a> {
         let mut values = vec![Datum::null(); natts];
         let mut nulls = vec![true; natts];
         let sys = spi::tuptable_with(tuptab, |t| {
-            for f in 0..natts {
-                let (v, isnull) = spi::SPI_getbinval(&t.vals[i], &t.tupdesc, (f + 1) as i32);
-                values[f] = v;
-                nulls[f] = isnull;
-            }
+            deform_tuptable_row(t, i, &mut values, &mut nulls);
             std::rc::Rc::new(RecSysAttrs::from_tuple(&t.vals[i]))
         });
         let mut owned = vec![false; natts];
@@ -3861,12 +3884,7 @@ impl<'a> Estate<'a> {
                 let mut values = vec![Datum::null(); natts];
                 let mut nulls = vec![true; natts];
                 let sys = spi::tuptable_with(tuptab, |t| {
-                    for f in 0..natts {
-                        let (v, isnull) =
-                            spi::SPI_getbinval(&t.vals[i], &t.tupdesc, (f + 1) as i32);
-                        values[f] = v;
-                        nulls[f] = isnull;
-                    }
+                    deform_tuptable_row(t, i, &mut values, &mut nulls);
                     std::rc::Rc::new(RecSysAttrs::from_tuple(&t.vals[i]))
                 });
                 self.move_rec_from_values(var, &desc, src_desc, &values, &nulls, Some(sys), true, true)
@@ -4873,11 +4891,21 @@ impl<'a> Estate<'a> {
         i: usize,
     ) -> PgResult<()> {
         let (desc, _src) = self.rec_desc_of(tuptab)?;
-        self.move_row_fields_into_varnos(varnos, &desc, |anum| {
-            spi::tuptable_with(tuptab, |t| {
-                spi::SPI_getbinval(&t.vals[i], &t.tupdesc, (anum + 1) as i32)
-            })
-        })
+        let natts = desc.types.len();
+        // Narrow rows (the common scalar-list case) deform into stack arrays.
+        let mut inline_values = [Datum::null(); INLINE_ROW_FIELDS];
+        let mut inline_nulls = [true; INLINE_ROW_FIELDS];
+        let mut heap_values;
+        let mut heap_nulls;
+        let (values, nulls): (&mut [Datum], &mut [bool]) = if natts <= INLINE_ROW_FIELDS {
+            (&mut inline_values[..natts], &mut inline_nulls[..natts])
+        } else {
+            heap_values = vec![Datum::null(); natts];
+            heap_nulls = vec![true; natts];
+            (&mut heap_values[..], &mut heap_nulls[..])
+        };
+        spi::tuptable_with(tuptab, |t| deform_tuptable_row(t, i, values, nulls));
+        self.move_row_fields_into_varnos(varnos, &desc, |anum| (values[anum], nulls[anum]))
     }
 
     // exec_move_row_from_fields' ROW arm (pl_exec.c:7181-7330) over an
