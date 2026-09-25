@@ -388,6 +388,7 @@ impl CompState {
             dno,
             recparentno: recno,
             fieldname: fieldname.to_string(),
+            lookup: Default::default(),
         }));
         dno
     }
