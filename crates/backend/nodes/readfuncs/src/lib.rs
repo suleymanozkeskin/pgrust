@@ -83,10 +83,29 @@ struct Reader<'a, 'mcx> {
     tok_start: usize,
 }
 
-const SPECIALS: &[u8] = b"(){}";
+// Byte classes of pg_strtok (read.c): token separators, one-byte tokens, and
+// bytes that continue a token.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ByteClass {
+    Space,
+    Special,
+    Token,
+}
 
-fn is_space(c: u8) -> bool {
-    c == b' ' || c == b'\n' || c == b'\t'
+static BYTE_CLASS: [ByteClass; 256] = {
+    let mut table = [ByteClass::Token; 256];
+    table[b' ' as usize] = ByteClass::Space;
+    table[b'\n' as usize] = ByteClass::Space;
+    table[b'\t' as usize] = ByteClass::Space;
+    table[b'(' as usize] = ByteClass::Special;
+    table[b')' as usize] = ByteClass::Special;
+    table[b'{' as usize] = ByteClass::Special;
+    table[b'}' as usize] = ByteClass::Special;
+    table
+};
+
+fn byte_class(c: u8) -> ByteClass {
+    BYTE_CLASS[c as usize]
 }
 
 fn lossy(t: &[u8]) -> String {
@@ -183,30 +202,35 @@ fn c_atoui(tok: &[u8]) -> u32 {
 impl<'a, 'mcx> Reader<'a, 'mcx> {
     // pg_strtok (read.c): "<>" comes back as an empty token (NULL marker).
     fn next_token(&mut self) -> Option<&'a [u8]> {
-        while self.pos < self.buf.len() && is_space(self.buf[self.pos]) {
-            self.pos += 1;
-        }
-        if self.pos >= self.buf.len() {
-            return None;
-        }
-        let start = self.pos;
-        self.tok_start = start;
-        if SPECIALS.contains(&self.buf[self.pos]) {
-            self.pos += 1;
-            return Some(&self.buf[start..self.pos]);
-        }
-        while self.pos < self.buf.len() {
-            let c = self.buf[self.pos];
-            if is_space(c) || SPECIALS.contains(&c) {
+        let buf = self.buf;
+        let mut pos = self.pos;
+        while let Some(&c) = buf.get(pos) {
+            if byte_class(c) != ByteClass::Space {
                 break;
             }
-            if c == b'\\' && self.pos + 1 < self.buf.len() {
-                self.pos += 2;
-            } else {
-                self.pos += 1;
+            pos += 1;
+        }
+        let Some(&first) = buf.get(pos) else {
+            self.pos = pos;
+            return None;
+        };
+        let start = pos;
+        self.tok_start = start;
+        pos += 1;
+        if byte_class(first) != ByteClass::Special {
+            // A backslash escapes the next byte (it is part of the token).
+            if first == b'\\' && pos < buf.len() {
+                pos += 1;
+            }
+            while let Some(&c) = buf.get(pos) {
+                if byte_class(c) != ByteClass::Token {
+                    break;
+                }
+                pos += if c == b'\\' && pos + 1 < buf.len() { 2 } else { 1 };
             }
         }
-        let tok = &self.buf[start..self.pos];
+        self.pos = pos;
+        let tok = &buf[start..pos];
         if tok == b"<>" {
             return Some(b"");
         }
