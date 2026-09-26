@@ -10521,6 +10521,7 @@ dependencies = [
  "commit_ts_seams",
  "condition_variable_seams",
  "controldata_utils",
+ "copyfuncs",
  "datum",
  "dbcommands_seams",
  "deadlock_seams",
