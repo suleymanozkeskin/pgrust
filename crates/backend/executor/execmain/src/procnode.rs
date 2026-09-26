@@ -36,15 +36,15 @@ pub struct InstrumentedNode<'mcx> {
 pub enum PlanStateNode<'mcx> {
     Result(ResultState<'mcx>),
     ProjectSet(PgBox<'mcx, ProjectSetState<'mcx>>),
-    SeqScan(::nodeseqscan::SeqScanState<'mcx>),
+    SeqScan(PgBox<'mcx, ::nodeseqscan::SeqScanState<'mcx>>),
     SampleScan(PgBox<'mcx, ::nodesamplescan::SampleScanState<'mcx>>),
     FunctionScan(PgBox<'mcx, ::nodefunctionscan::FunctionScanState<'mcx>>),
     ValuesScan(PgBox<'mcx, ::nodevaluesscan::ValuesScanState<'mcx>>),
     TableFuncScan(PgBox<'mcx, ::nodetablefuncscan::TableFuncScanState<'mcx>>),
     CteScan(PgBox<'mcx, ::nodectescan::CteScanState<'mcx>>),
-    IndexScan(::nodeindexscan::IndexScanState<'mcx>),
-    TidScan(::nodetidscan::TidScanState<'mcx>),
-    TidRangeScan(::nodetidrangescan::TidRangeScanState<'mcx>),
+    IndexScan(PgBox<'mcx, ::nodeindexscan::IndexScanState<'mcx>>),
+    TidScan(PgBox<'mcx, ::nodetidscan::TidScanState<'mcx>>),
+    TidRangeScan(PgBox<'mcx, ::nodetidrangescan::TidRangeScanState<'mcx>>),
     IndexOnlyScan(PgBox<'mcx, ::nodeindexonlyscan::IndexOnlyScanState<'mcx>>),
     Agg(PgBox<'mcx, AggPlanState<'mcx>>),
     Sort(SortNode<'mcx>),
@@ -400,7 +400,9 @@ pub struct MergeJoinNode<'mcx> {
 }
 
 // Init-time tree node touched by &mut per tuple; rule-9 budget covers the per-row carriers inside.
-const _: () = assert!(core::mem::size_of::<PlanStateNode<'static>>() <= 1024);
+// exec_init_node returns it by value, so every plan node is moved at this
+// size: states near 1 kB (the scan states) are boxed, as C's PlanState* is.
+const _: () = assert!(core::mem::size_of::<PlanStateNode<'static>>() <= 288);
 
 impl<'mcx> PlanStateNode<'mcx> {
     #[inline]
@@ -634,12 +636,13 @@ pub fn exec_init_node<'mcx>(
             stack_depth_core::with_own_frame(|| -> PgResult<PlanStateNode<'mcx>> {
                 Ok({
                     let mcx = estate.es_query_cxt;
-                    PlanStateNode::SeqScan(::nodeseqscan::exec_init_seq_scan(
+                    let state = ::nodeseqscan::exec_init_seq_scan(
                         mcx,
                         node.as_seq_scan().unwrap(),
                         estate,
                         eflags,
-                    )?)
+                    )?;
+                    PlanStateNode::SeqScan(::mcx::alloc_in(mcx, state)?)
                 })
             })?
         }
@@ -757,12 +760,13 @@ pub fn exec_init_node<'mcx>(
             stack_depth_core::with_own_frame(|| -> PgResult<PlanStateNode<'mcx>> {
                 Ok({
                     let mcx = estate.es_query_cxt;
-                    PlanStateNode::IndexScan(::nodeindexscan::exec_init_index_scan(
+                    let state = ::nodeindexscan::exec_init_index_scan(
                         mcx,
                         node.as_index_scan().unwrap(),
                         estate,
                         eflags,
-                    )?)
+                    )?;
+                    PlanStateNode::IndexScan(::mcx::alloc_in(mcx, state)?)
                 })
             })?
         }
@@ -770,12 +774,13 @@ pub fn exec_init_node<'mcx>(
             stack_depth_core::with_own_frame(|| -> PgResult<PlanStateNode<'mcx>> {
                 Ok({
                     let mcx = estate.es_query_cxt;
-                    PlanStateNode::TidScan(::nodetidscan::exec_init_tid_scan(
+                    let state = ::nodetidscan::exec_init_tid_scan(
                         mcx,
                         node.as_tid_scan().unwrap(),
                         estate,
                         eflags,
-                    )?)
+                    )?;
+                    PlanStateNode::TidScan(::mcx::alloc_in(mcx, state)?)
                 })
             })?
         }
@@ -783,12 +788,13 @@ pub fn exec_init_node<'mcx>(
             stack_depth_core::with_own_frame(|| -> PgResult<PlanStateNode<'mcx>> {
                 Ok({
                     let mcx = estate.es_query_cxt;
-                    PlanStateNode::TidRangeScan(::nodetidrangescan::exec_init_tid_range_scan(
+                    let state = ::nodetidrangescan::exec_init_tid_range_scan(
                         mcx,
                         node.as_tid_range_scan().unwrap(),
                         estate,
                         eflags,
-                    )?)
+                    )?;
+                    PlanStateNode::TidRangeScan(::mcx::alloc_in(mcx, state)?)
                 })
             })?
         }
@@ -2173,10 +2179,11 @@ fn agg_arm<'mcx>(
                 // alone (scan-drive precedent): the census reads bits, not
                 // the prefix; fallback rows re-check off the stored tuple.
                 let qual_only = ::nodeagg::agg_batch_outer_prefix(agg) == Some(0);
+                let prefix = fused_soa_prefix(agg, ss).unwrap_or(0);
                 ::nodeseqscan::seq_scan_batch_soa_prepare(
                     ss,
                     estate,
-                    fused_soa_prefix(agg, ss).unwrap_or(0),
+                    prefix,
                     qual_only,
                     false,
                     false,
@@ -4149,10 +4156,11 @@ impl<'mcx> ::nodehash::HashBuildInput<'mcx> for PlanStateNode<'mcx> {
                 && hash_build_fusible(ss, estate)
                 && ::nodeseqscan::seq_scan_batch_supported(ss, estate)?;
             if engaged {
+                let prefix = hash_build_soa_prefix(hs, ss).unwrap_or(0);
                 ::nodeseqscan::seq_scan_batch_soa_prepare(
                     ss,
                     estate,
-                    hash_build_soa_prefix(hs, ss).unwrap_or(0),
+                    prefix,
                     false,
                     false,
                     false,
