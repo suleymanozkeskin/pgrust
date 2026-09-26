@@ -111,7 +111,8 @@ enum CtxRelease {
     Pool(CallContextKind),
 }
 
-// The per-call contexts that CallContextPool keeps, one list per kind.
+// The contexts that CallContextPool keeps, one list per kind: two per call,
+// and one per simple expression per transaction.
 #[derive(Clone, Copy)]
 enum CallContextKind {
     // C's datum_context (plpgsql_estate_setup, pl_exec.c:4027: the SPI
@@ -121,6 +122,9 @@ enum CallContextKind {
     Values,
     // C's eval_mcontext: reset-wholesale scratch.
     Scratch,
+    // The compiled program of one simple expression, rebuilt once per
+    // transaction (C: simple_eval_estate's context, pl_exec.c:6172-6180).
+    SimpleExpr,
 }
 
 impl CallContextKind {
@@ -128,17 +132,19 @@ impl CallContextKind {
         match self {
             CallContextKind::Values => MemoryContext::new_wholesale("PLpgSQL per-invocation values"),
             CallContextKind::Scratch => MemoryContext::new_bump("PLpgSQL eval scratch"),
+            CallContextKind::SimpleExpr => MemoryContext::new_bump("PLpgSQL simple expression"),
         }
     }
 }
 
-// Per-call contexts of finished calls, reset, kept for the next call on this
-// thread (C: aset.c context_freelists keeps deleted contexts for reuse).
+// Contexts of finished calls and replaced simple expressions, reset, kept for
+// the next use on this thread (C: aset.c context_freelists keeps deleted contexts for reuse).
 // Bounded by POOLED_CALL_CONTEXTS per kind; emptied by
 // release_plpgsql_state_at_exit.
 struct CallContextPool {
     values: Vec<*mut MemoryContext>,
     scratch: Vec<*mut MemoryContext>,
+    simple_expr: Vec<*mut MemoryContext>,
 }
 
 const POOLED_CALL_CONTEXTS: usize = 8;
@@ -148,6 +154,7 @@ impl CallContextPool {
         match kind {
             CallContextKind::Values => &mut self.values,
             CallContextKind::Scratch => &mut self.scratch,
+            CallContextKind::SimpleExpr => &mut self.simple_expr,
         }
     }
 }
@@ -155,7 +162,7 @@ impl CallContextPool {
 impl Drop for CallContextPool {
     // Also the fallback for a thread that ends without the exit chain.
     fn drop(&mut self) {
-        for context in self.values.drain(..).chain(self.scratch.drain(..)) {
+        for context in self.values.drain(..).chain(self.scratch.drain(..)).chain(self.simple_expr.drain(..)) {
             // SAFETY: Box::into_raw provenance; the pool is the only owner.
             drop(unsafe { Box::from_raw(context) });
         }
@@ -164,7 +171,13 @@ impl Drop for CallContextPool {
 
 std::thread_local! {
     static CALL_CONTEXT_POOL: core::cell::RefCell<CallContextPool> =
-        const { core::cell::RefCell::new(CallContextPool { values: Vec::new(), scratch: Vec::new() }) };
+        const {
+            core::cell::RefCell::new(CallContextPool {
+                values: Vec::new(),
+                scratch: Vec::new(),
+                simple_expr: Vec::new(),
+            })
+        };
 }
 
 fn release_call_context_pool() {
@@ -173,6 +186,7 @@ fn release_call_context_pool() {
         CallContextPool {
             values: core::mem::take(&mut pool.values),
             scratch: core::mem::take(&mut pool.scratch),
+            simple_expr: core::mem::take(&mut pool.simple_expr),
         }
     });
     drop(pool);
@@ -183,7 +197,7 @@ impl Ctx {
     pub fn new(name: &'static str) -> Ctx {
         Ctx { context: Box::into_raw(Box::new(MemoryContext::new_bump(name))), release: CtxRelease::Drop }
     }
-    // A per-call context of `kind`, reused from this thread's pool when one
+    // A context of `kind`, reused from this thread's pool when one
     // is there.
     fn for_call(kind: CallContextKind) -> Ctx {
         register_exit_release();
@@ -2122,6 +2136,13 @@ impl<'a> Estate<'a> {
     // exec_eval_expr: returns (value, isnull, rettype, rettypmod). Caller
     // must exec_eval_cleanup when done with a by-ref result.
     pub fn exec_eval_expr(&mut self, expr: &PlExpr) -> PgResult<(Datum, bool, Oid, i32)> {
+        self.exec_eval_expr_with(expr, CURSOR_OPT_PARALLEL_OK)
+    }
+
+    // exec_eval_expr with the cursor options its slow path prepares with:
+    // CURSOR_OPT_PARALLEL_OK for expressions (pl_exec.c exec_eval_expr), 0
+    // for assignment sources (exec_assign_expr).
+    fn exec_eval_expr_with(&mut self, expr: &PlExpr, cursor_options: i32) -> PgResult<(Datum, bool, Oid, i32)> {
         // Steady state first, before any plan-cache traffic: C's
         // exec_eval_expr (pl_exec.c:5673) prepares the plan once per
         // function lifetime and exec_eval_simple_expr revalidates with
@@ -2134,7 +2155,7 @@ impl<'a> Estate<'a> {
             return Ok(r);
         }
 
-        self.ensure_plan(expr, CURSOR_OPT_PARALLEL_OK)?;
+        self.ensure_plan(expr, cursor_options)?;
 
         if let Some(r) = self.exec_eval_simple_expr(expr)? {
             return Ok(r);
@@ -2364,7 +2385,7 @@ impl<'a> Estate<'a> {
             // compiles into simple_eval_estate->es_query_cxt and rebuilds
             // per transaction, pl_exec.c:6172-6180; see SimpleExpr's
             // lifetime note for why no rebuild is needed here).
-            let ctx = Ctx::new("PLpgSQL simple expression");
+            let ctx = Ctx::for_call(CallContextKind::SimpleExpr);
             let Some(state) = execexpr::exec_init_expr(ctx.mcx(), Some(plan_expr.0), bind)?
             else {
                 return Ok(None);
@@ -3607,8 +3628,14 @@ impl<'a> Estate<'a> {
                 return Err(spi_ctx_err(err, &expr.query, expr.parse_mode));
             }
         }
-        self.ensure_plan(expr, 0)?;
-        let (value, isnull, valtype, valtypmod) = self.exec_eval_expr(expr)?;
+        // pl_exec.c exec_assign_expr: prepare (without parallelism) only when
+        // the expression has no plan yet; later evaluations go through
+        // exec_eval_expr's simple-expression fast path, whose slow path
+        // re-prepares with the same options.
+        if !planned {
+            self.ensure_plan(expr, 0)?;
+        }
+        let (value, isnull, valtype, valtypmod) = self.exec_eval_expr_with(expr, 0)?;
         self.exec_assign_value(target, value, isnull, valtype, valtypmod)?;
         self.exec_eval_cleanup();
         Ok(())
