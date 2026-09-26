@@ -33,6 +33,8 @@ use types_snapshot::{SnapshotData, SNAPSHOT_ANY};
 use types_tuple::itemptr::{ItemPointerIsValid, ItemPointerSetInvalid};
 use types_tuple::{ItemPointerData, TupleDescData};
 
+mod check_trees;
+
 // The FDW-modify half of C's FdwRoutine (fdwapi.h), installed per FdwKind by
 // the provider's init_seams (nodeforeignscan's FdwExecRoutine pattern). Not
 // installed = the provider has no ExecForeign{Insert,Update,Delete}
@@ -10406,14 +10408,16 @@ fn exec_rel_check<'mcx, const ROW: bool>(
             .map_err(|_| {
                 Box::new(mcx.oom(constr.check.len() * core::mem::size_of::<CheckExpr<'_>>()))
             })?;
-        for c in constr.check.iter() {
+        let parsed = check_trees::parsed_checks(mcx, rel.rd_id, &constr.check)?;
+        for (c, parsed) in constr.check.iter().zip(parsed) {
             let name = c.ccname.as_ref().expect("ccname").clone_in(mcx)?;
-            if !c.ccenforced {
-                compiled.push(CheckExpr { name, state: None });
-                continue;
-            }
-            let ccbin = c.ccbin.as_ref().expect("ccbin");
-            let mut node = readfuncs::stringToNode(mcx, ccbin.as_str())?;
+            let mut node = match parsed {
+                check_trees::ParsedCheck::NotEnforced => {
+                    compiled.push(CheckExpr { name, state: None });
+                    continue;
+                }
+                check_trees::ParsedCheck::Tree(node) => node,
+            };
             if constr.has_generated_virtual {
                 // execMain.c:1818 expand_generated_columns_in_expr.
                 node = expand_generated_columns_in_expr(mcx, node, rel, 1)?.unwrap_or(node);
