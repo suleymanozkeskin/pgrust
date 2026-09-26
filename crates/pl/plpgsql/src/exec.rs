@@ -194,6 +194,30 @@ impl SourceColumn {
     }
 }
 
+// The RecDesc of a named composite type, built once per type-cache
+// descriptor and kept on the variable's RecTypeIdent. The descriptor is held
+// weakly and compared by address: the compiled function outlives the
+// session's type cache (whose descriptors live in session memory, and whose
+// tupdesc identifiers restart per session), and the weak reference keeps the
+// address from being reused while the shape exists.
+pub struct RecShape {
+    tupdesc: std::rc::Weak<types_tuple::TupleDescData<'static>>,
+    desc: std::rc::Rc<RecDesc>,
+}
+
+// A named composite rec's current declared descriptor (the type cache's,
+// shared) and the RecDesc built from it.
+struct DeclaredShape {
+    tupdesc: std::rc::Rc<types_tuple::TupleDescData<'static>>,
+    desc: std::rc::Rc<RecDesc>,
+}
+
+// The result of exec_move_row's no-coercion test.
+enum RowMove {
+    Stored,
+    NeedsCoercion,
+}
+
 // The heap tuple a record was bound from (C's expanded record fvalue, kept
 // across field assignments); absent for a record built from fields.
 #[derive(Clone, Copy)]
@@ -293,7 +317,7 @@ pub(crate) fn detoast_external_fields(
 // keeps the physical tupdesc so the record can re-materialize as a
 // composite Datum, dropped columns included).
 pub struct RecValue {
-    pub desc: RecDesc,
+    pub desc: std::rc::Rc<RecDesc>,
     pub values: Vec<Datum>,
     pub nulls: Vec<bool>,
     pub src_desc: Option<std::rc::Rc<types_tuple::TupleDescData<'static>>>,
@@ -1625,6 +1649,30 @@ impl<'a> Estate<'a> {
         Ok(())
     }
 
+    // The declared descriptor of named-composite rec `recno` as the type
+    // cache holds it now (the base type's for a composite domain), with its
+    // RecDesc. Call after revalidate_rectypeid. The RecDesc is rebuilt only
+    // when the type cache's descriptor changes. None when the type cache has
+    // no descriptor for the type; callers then look the type up themselves.
+    fn rec_declared_shape(&self, recno: Dno) -> Option<DeclaredShape> {
+        let ident = self.rec_meta(recno).datatype.as_ref()?.rec_ident.as_ref()?;
+        let tupdesc = ident.tcache.borrow().upgrade()?.tupdesc()?;
+        let mut cached = ident.shape.borrow_mut();
+        match cached.as_ref() {
+            Some(shape) if core::ptr::eq(shape.tupdesc.as_ptr(), std::rc::Rc::as_ptr(&tupdesc)) => {
+                Some(DeclaredShape { tupdesc, desc: shape.desc.clone() })
+            }
+            _ => {
+                let desc = std::rc::Rc::new(RecDesc::from_tupdesc(&tupdesc));
+                *cached = Some(RecShape {
+                    tupdesc: std::rc::Rc::downgrade(&tupdesc),
+                    desc: desc.clone(),
+                });
+                Some(DeclaredShape { tupdesc, desc })
+            }
+        }
+    }
+
     // A rec declared with a domain-over-composite type (PLPGSQL_TTYPE_REC
     // via pl_comp.c's TYPTYPE_DOMAIN arm) keeps the domain oid in rectypeid;
     // its tupdesc is the base type's (C expandedrecord DOMAIN_BASE_INFO).
@@ -1682,9 +1730,15 @@ impl<'a> Estate<'a> {
         let rectypeid = self.rec_typeid(recno);
         // C make_expanded_record_from_typeid: a composite-domain rec gets its
         // BASE type's tupdesc (typcache DOMAIN_BASE_INFO).
-        let base = Self::rec_base_typeid(rectypeid)?;
-        let td = typcache::lookup_rowtype_tupdesc_copy(self.datum_ctx.mcx(), base, -1)?;
-        let desc = RecDesc::from_tupdesc(&td);
+        let (td, desc) = match self.rec_declared_shape(recno) {
+            Some(shape) => (shape.tupdesc, shape.desc),
+            None => {
+                let base = Self::rec_base_typeid(rectypeid)?;
+                let td = typcache::lookup_rowtype_tupdesc_copy(self.datum_ctx.mcx(), base, -1)?;
+                let desc = std::rc::Rc::new(RecDesc::from_tupdesc(&td));
+                (std::rc::Rc::new(td), desc)
+            }
+        };
         let n = desc.types.len();
         self.assign_record_var(
             recno,
@@ -1692,7 +1746,7 @@ impl<'a> Estate<'a> {
                 desc,
                 values: vec![Datum::null(); n],
                 nulls: vec![true; n],
-                src_desc: Some(std::rc::Rc::new(td)),
+                src_desc: Some(td),
                 empty: true,
                 sys: None,
                 fvalue_valid: false,
@@ -3906,23 +3960,101 @@ impl<'a> Estate<'a> {
     // exec_move_row from tuptable row i.
     fn move_row_from_tuptable(&mut self, var: Dno, tuptab: TuptabHandle, i: usize) -> PgResult<()> {
         match &self.func.datums[var as usize] {
-            PlDatum::Rec(_) => {
-                let (desc, src_desc) = self.rec_desc_of(tuptab)?;
-                let natts = desc.types.len();
-                let mut values = vec![Datum::null(); natts];
-                let mut nulls = vec![true; natts];
-                let sys = spi::tuptable_with(tuptab, |t| {
-                    deform_tuptable_row(t, i, &mut values, &mut nulls);
-                    std::rc::Rc::new(RecSysAttrs::from_tuple(&t.vals[i]))
-                });
-                self.move_rec_from_values(var, &desc, src_desc, &values, &nulls, Some(sys), true, true)
+            PlDatum::Rec(r) if r.rectypeid != RECORDOID => {
+                self.revalidate_rectypeid(var)?;
+                if let Some(shape) = self.rec_declared_shape(var) {
+                    match self.store_row_if_compatible(var, tuptab, i, shape)? {
+                        RowMove::Stored => return Ok(()),
+                        RowMove::NeedsCoercion => {}
+                    }
+                }
+                self.move_rec_from_tuptable_fields(var, tuptab, i)
             }
+            PlDatum::Rec(_) => self.move_rec_from_tuptable_fields(var, tuptab, i),
             PlDatum::Row(r) => {
                 let varnos = r.varnos.clone();
                 self.move_row_into_varnos(&varnos, tuptab, i)
             }
             _ => panic!("plpgsql exec_move_row: bad target datum {var}"),
         }
+    }
+
+    // exec_move_row's no-coercion arm (pl_exec.c): when the source row has
+    // the rec's declared type or is physically compatible with it
+    // (compatible_tupdescs), the row is stored as is, with no per-field cast
+    // and no copy of the source descriptor. By-ref fields are copied into the
+    // datum context, and dropped columns read NULL, as in the by-field path.
+    fn store_row_if_compatible(
+        &mut self,
+        recno: Dno,
+        tuptab: TuptabHandle,
+        i: usize,
+        shape: DeclaredShape,
+    ) -> PgResult<RowMove> {
+        let rectypeid = self.rec_typeid(recno);
+        let natts = shape.desc.types.len();
+        let mut values = vec![Datum::null(); natts];
+        let mut nulls = vec![true; natts];
+        let sys = spi::tuptable_with(tuptab, |t| {
+            if rectypeid == t.tupdesc.tdtypeid || compatible_tupdescs(&t.tupdesc, &shape.tupdesc) {
+                deform_tuptable_row(t, i, &mut values, &mut nulls);
+                Some(std::rc::Rc::new(RecSysAttrs::from_tuple(&t.vals[i])))
+            } else {
+                None
+            }
+        });
+        let Some(sys) = sys else {
+            return Ok(RowMove::NeedsCoercion);
+        };
+        let desc = shape.desc;
+        for f in 0..natts {
+            if desc.dropped[f] {
+                values[f] = Datum::null();
+                nulls[f] = true;
+            }
+        }
+        // Domain check BEFORE committing, as in move_rec_from_values.
+        if Self::rec_base_typeid(rectypeid)? != rectypeid {
+            self.rec_domain_check_fields(rectypeid, &shape.tupdesc, &values, &nulls)?;
+        }
+        for f in 0..natts {
+            if !desc.dropped[f] {
+                values[f] =
+                    self.assign_copy_to_datum_ctx(values[f], nulls[f], desc.typlens[f], desc.typbyvals[f])?;
+            }
+        }
+        let owned = (0..natts)
+            .map(|f| !desc.dropped[f] && !nulls[f] && !desc.typbyvals[f])
+            .collect();
+        self.assign_record_var(
+            recno,
+            Some(RecValue {
+                desc,
+                values,
+                nulls,
+                src_desc: Some(shape.tupdesc),
+                empty: false,
+                fvalue_valid: true,
+                sys: Some(sys),
+                owned,
+            }),
+        );
+        Ok(RowMove::Stored)
+    }
+
+    // exec_move_row by fields for rec `var`: the source row is deformed
+    // against a copy of its descriptor and assigned through
+    // move_rec_from_values.
+    fn move_rec_from_tuptable_fields(&mut self, var: Dno, tuptab: TuptabHandle, i: usize) -> PgResult<()> {
+        let (desc, src_desc) = self.rec_desc_of(tuptab)?;
+        let natts = desc.types.len();
+        let mut values = vec![Datum::null(); natts];
+        let mut nulls = vec![true; natts];
+        let sys = spi::tuptable_with(tuptab, |t| {
+            deform_tuptable_row(t, i, &mut values, &mut nulls);
+            std::rc::Rc::new(RecSysAttrs::from_tuple(&t.vals[i]))
+        });
+        self.move_rec_from_values(var, &desc, src_desc, &values, &nulls, Some(sys), true, true)
     }
 
     // The strict_multi_assignment report (pl_exec.c:7286-7297); Err only at
@@ -3985,7 +4117,7 @@ impl<'a> Estate<'a> {
             self.assign_record_var(
                 recno,
                 Some(RecValue {
-                    desc: srcdesc.clone(),
+                    desc: std::rc::Rc::new(srcdesc.clone()),
                     values: out_values,
                     nulls: nulls.to_vec(),
                     src_desc: Some(src_tupdesc),
@@ -4001,15 +4133,20 @@ impl<'a> Estate<'a> {
         self.revalidate_rectypeid(recno)?;
         let rectypeid = self.rec_typeid(recno);
         let base = Self::rec_base_typeid(rectypeid)?;
-        let var_td = match &self.datums[recno as usize] {
-            DatumVal::Rec(Some(RecValue { src_desc: Some(td), .. })) => td.clone(),
-            _ => std::rc::Rc::new(typcache::lookup_rowtype_tupdesc_copy(
+        let shape = self.rec_declared_shape(recno);
+        let var_td = match (&self.datums[recno as usize], &shape) {
+            (DatumVal::Rec(Some(RecValue { src_desc: Some(td), .. })), _) => td.clone(),
+            (_, Some(shape)) => shape.tupdesc.clone(),
+            (_, None) => std::rc::Rc::new(typcache::lookup_rowtype_tupdesc_copy(
                 self.datum_ctx.mcx(),
                 base,
                 -1,
             )?),
         };
-        let dst = RecDesc::from_tupdesc(&var_td);
+        let dst = match shape {
+            Some(shape) if std::rc::Rc::ptr_eq(&shape.tupdesc, &var_td) => shape.desc,
+            _ => std::rc::Rc::new(RecDesc::from_tupdesc(&var_td)),
+        };
         let sys = if rectypeid == src_tupdesc.tdtypeid || compatible_tupdescs(&src_tupdesc, &var_td) {
             sys
         } else {
@@ -4135,7 +4272,7 @@ impl<'a> Estate<'a> {
         }
         let owned = (0..n).map(|i| !scratch && !nulls[i] && !desc.typbyvals[i]).collect();
         Ok(RecValue {
-            desc,
+            desc: std::rc::Rc::new(desc),
             values,
             nulls,
             src_desc: Some(std::rc::Rc::new(td)),
@@ -6203,7 +6340,7 @@ pub(crate) mod cfi_tests {
         tup.t_self = types_tuple::ItemPointerData::new(0, 1);
         tup.t_tableOid = 4242;
         let bound = |sys: Option<RecSysAttrs>| RecValue {
-            desc: RecDesc::from_tupdesc(&td),
+            desc: std::rc::Rc::new(RecDesc::from_tupdesc(&td)),
             values: vec![Datum::from_i32(7)],
             nulls: vec![false],
             owned: vec![false],
@@ -6266,7 +6403,7 @@ pub(crate) mod cfi_tests {
         tup.t_self = types_tuple::ItemPointerData::new(0, 1);
         tup.t_tableOid = 4242;
         estate.datums[0] = DatumVal::Rec(Some(RecValue {
-            desc: RecDesc::from_tupdesc(&td),
+            desc: std::rc::Rc::new(RecDesc::from_tupdesc(&td)),
             values: vec![Datum::from_i32(7)],
             nulls: vec![false],
             owned: vec![false],
@@ -6500,6 +6637,7 @@ pub(crate) mod cfi_tests {
                 typoid: core::cell::Cell::new(COMP_OLD),
                 tupdesc_id: core::cell::Cell::new(tcache.tupdesc_identifier()),
                 tcache: core::cell::RefCell::new(std::rc::Rc::downgrade(&tcache)),
+                shape: core::cell::RefCell::new(None),
             })
         };
         let cached_id = || ident.tcache.borrow().upgrade().unwrap().tupdesc_identifier();

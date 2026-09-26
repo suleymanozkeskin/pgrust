@@ -1597,7 +1597,7 @@ fn coerce_function_result_tuple(
             let (desc, src, values, nulls, _) = estate.deconstruct_composite(retval)?;
             crate::exec::RecValue {
                 owned: vec![false; values.len()],
-                desc,
+                desc: std::rc::Rc::new(desc),
                 values,
                 nulls,
                 src_desc: Some(src),
@@ -1943,7 +1943,7 @@ fn plpgsql_exec_trigger(
     // C makes empty expanded records for BOTH variables (pl_exec.c:966-984):
     // unsupplied tuples read as NULL, whole-record use is SQL NULL.
     let empty_rv = crate::exec::RecValue {
-        desc: desc.clone(),
+        desc: std::rc::Rc::new(desc.clone()),
         values: vec![Datum::null(); natts],
         nulls: vec![true; natts],
         src_desc: Some(src_desc),
@@ -2037,7 +2037,7 @@ fn plpgsql_exec_trigger(
             };
             crate::exec::RecValue {
                 owned: vec![false; values.len()],
-                desc: d,
+                desc: std::rc::Rc::new(d),
                 values,
                 nulls,
                 src_desc: Some(s),
@@ -2216,7 +2216,7 @@ mod tests {
             let mut estate = Estate::new(&func, false, true);
             let returned = int4_row(estate.datum_mcx(), 2);
             estate.ret_rec = Some(crate::exec::RecValue {
-                desc: crate::exec::RecDesc::from_tupdesc(&returned),
+                desc: std::rc::Rc::new(crate::exec::RecDesc::from_tupdesc(&returned)),
                 values: vec![Datum::from_i32(42), Datum::from_i32(43)],
                 nulls: vec![false, false],
                 owned: vec![false, false],

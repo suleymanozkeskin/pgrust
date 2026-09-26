@@ -27,6 +27,8 @@ pub struct RecTypeIdent {
     pub typoid: Cell<Oid>,
     pub tcache: RefCell<Weak<typcache::TypeCacheEntry>>,
     pub tupdesc_id: Cell<u64>,
+    // The declared row shape last built for this type (see RecShape).
+    pub shape: RefCell<Option<crate::exec::RecShape>>,
 }
 
 impl core::fmt::Debug for RecTypeIdent {
