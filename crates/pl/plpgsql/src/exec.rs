@@ -228,7 +228,7 @@ impl Drop for Ctx {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct RecDesc {
     pub names: Vec<String>,
     pub types: Vec<Oid>,
@@ -243,6 +243,20 @@ pub struct RecDesc {
 }
 
 impl RecDesc {
+    // True when from_tupdesc(`td`) would build a RecDesc equal to this one.
+    pub fn matches_tupdesc(&self, td: &types_tuple::TupleDescData<'_>) -> bool {
+        self.types.len() == td.attrs.len()
+            && td.attrs.iter().enumerate().all(|(i, a)| {
+                self.types[i] == a.atttypid
+                    && self.typmods[i] == a.atttypmod
+                    && self.typlens[i] == a.attlen
+                    && self.typbyvals[i] == a.attbyval
+                    && self.colls[i] == a.attcollation
+                    && self.dropped[i] == a.attisdropped
+                    && self.names[i].as_bytes() == a.attname.name_str()
+            })
+    }
+
     pub fn from_tupdesc(td: &types_tuple::TupleDescData<'_>) -> RecDesc {
         let natts = td.attrs.len();
         let mut d = RecDesc {
@@ -469,6 +483,12 @@ pub struct TupleCopy {
 }
 
 impl TupleCopy {
+    // The copied tuple image (header and data).
+    pub(crate) fn image(&self) -> &[u8] {
+        // SAFETY: `len` bytes were copied into the allocation at `ptr`.
+        unsafe { core::slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
+    }
+
     fn layout(len: usize) -> core::alloc::Layout {
         core::alloc::Layout::from_size_align(len, 8).expect("tuple copy layout")
     }
@@ -6479,6 +6499,7 @@ pub(crate) mod cfi_tests {
             print_strict_params: false,
             nstatements: 0,
             expr_ids: Vec::new(),
+            trigger_shape: Default::default(),
         }
     }
 

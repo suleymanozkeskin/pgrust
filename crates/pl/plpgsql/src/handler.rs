@@ -872,6 +872,7 @@ fn do_compile(
         print_strict_params: comp.print_strict_params,
         nstatements: comp.nstatements,
         expr_ids: std::mem::take(&mut comp.expr_ids),
+        trigger_shape: Default::default(),
     })
 }
 
@@ -1274,6 +1275,7 @@ fn compile_inline(src: &str) -> PgResult<PlFunction> {
         print_strict_params: comp.print_strict_params,
         nstatements: comp.nstatements,
         expr_ids: std::mem::take(&mut comp.expr_ids),
+        trigger_shape: Default::default(),
     })
 }
 
@@ -1702,14 +1704,92 @@ const TYPALIGN_INT: u8 = b'i';
 // resolved by ER_lookup_fieldnum/namestrcmp case-sensitively
 // (expandedrecord.c:1032), so downcasing here made every quoted mixed-case
 // column of the trigger table unreachable through NEW/OLD.
-fn recdesc_from_tupdesc(td: &types_tuple::TupleDescData<'_>) -> (crate::exec::RecDesc, Vec<bool>) {
-    let d = crate::exec::RecDesc::from_tupdesc(td);
-    let generated = td
-        .attrs
-        .iter()
-        .map(|a| a.attgenerated == ATTRIBUTE_GENERATED_STORED)
-        .collect();
-    (d, generated)
+// The trigger relation's RecDesc and stored-generated flags, reused from the
+// function's previous call while the relation's descriptor still matches.
+fn trigger_row_shape(func: &PlFunction, td: &types_tuple::TupleDescData<'_>) -> crate::ast::TriggerRowShape {
+    let mut cached = func.trigger_shape.borrow_mut();
+    if let Some(shape) = cached.as_ref() {
+        let generated_match = shape.generated.len() == td.attrs.len()
+            && td
+                .attrs
+                .iter()
+                .zip(shape.generated.iter())
+                .all(|(a, g)| (a.attgenerated == ATTRIBUTE_GENERATED_STORED) == *g);
+        if generated_match && shape.desc.matches_tupdesc(td) {
+            return shape.clone();
+        }
+    }
+    let shape = crate::ast::TriggerRowShape {
+        desc: Rc::new(crate::exec::RecDesc::from_tupdesc(td)),
+        generated: td.attrs.iter().map(|a| a.attgenerated == ATTRIBUTE_GENERATED_STORED).collect(),
+    };
+    *cached = Some(shape.clone());
+    shape
+}
+
+// The tuple image of the NEW or OLD record when `rv` (the returned record) is
+// that record unchanged: same row shape as the relation, no field assigned
+// since the tuple was bound (fvalue_valid), a whole-tuple copy present, and
+// no external values (the field-by-field path would detoast them).
+fn unchanged_trigger_row<'e>(
+    estate: &'e Estate<'_>,
+    func: &PlFunction,
+    rv: &crate::exec::RecValue,
+    desc: &Rc<crate::exec::RecDesc>,
+) -> Option<&'e [u8]> {
+    if !rv.fvalue_valid || rv.empty || !Rc::ptr_eq(&rv.desc, desc) {
+        return None;
+    }
+    [func.new_varno, func.old_varno].into_iter().find_map(|varno| {
+        let crate::exec::DatumVal::Rec(Some(bound)) = &estate.datums[varno as usize] else {
+            return None;
+        };
+        let copy = bound.tuple_copy.as_ref()?;
+        let same = bound.fvalue_valid
+            && !bound.empty
+            && Rc::ptr_eq(&bound.desc, desc)
+            && bound.nulls == rv.nulls
+            && bound.values.iter().zip(rv.values.iter()).all(|(b, r)| b.as_usize() == r.as_usize());
+        if !same {
+            return None;
+        }
+        let image = copy.image();
+        // SAFETY: `image` is a complete heap-tuple image (TupleCopy::of),
+        // MAXALIGN-aligned, read only for this check.
+        let external = unsafe {
+            types_tuple::HeapTupleData::from_raw_parts(
+                image.as_ptr(),
+                image.len() as u32,
+                types_tuple::ItemPointerData::invalid(),
+                types_core::InvalidOid,
+            )
+        }
+        .has_external();
+        (!external).then_some(image)
+    })
+}
+
+// SPI_copytuple of a trigger result image into the caller's context, as the
+// field-by-field path returns it (invalid ctid, the relation's OID).
+fn copy_trigger_row(out_mcx: Mcx<'_>, image: &[u8], relid: Oid) -> PgResult<Datum> {
+    let layout = core::alloc::Layout::from_size_align(image.len(), 8).expect("tuple layout");
+    let img = mcx::Allocator::allocate(&out_mcx, layout)
+        .map_err(|_| Box::new(out_mcx.oom(image.len())))?
+        .cast::<u8>();
+    // SAFETY: the new allocation has image.len() bytes and does not overlap.
+    unsafe { core::ptr::copy_nonoverlapping(image.as_ptr(), img.as_ptr(), image.len()) };
+    // SAFETY: img is a live heap-tuple image of image.len() bytes in out_mcx.
+    let htd = unsafe {
+        types_tuple::HeapTupleData::from_raw_parts(
+            img.as_ptr(),
+            image.len() as u32,
+            types_tuple::ItemPointerData::invalid(),
+            relid,
+        )
+    };
+    let boxed = mcx::alloc_in(out_mcx, htd)?;
+    let p = mcx::leak_in(boxed) as *mut types_tuple::HeapTupleData<'_>;
+    Ok(Datum::from_usize(p as usize))
 }
 
 // name datum (NAMEOID): 64-byte NUL-padded image in `mcx`.
@@ -1930,14 +2010,14 @@ fn plpgsql_exec_trigger(
 
     let rel = trigdata.tg_relation;
     let tupdesc = rel.rd_att.clone();
-    let (desc, generated) = recdesc_from_tupdesc(&tupdesc);
+    let crate::ast::TriggerRowShape { desc, generated } = trigger_row_shape(func, &tupdesc);
     let natts = desc.types.len();
     let src_desc =
         Rc::new(tupdesc::CreateTupleDescCopy(estate.datum_mcx(), &tupdesc)?);
     // C makes empty expanded records for BOTH variables (pl_exec.c:966-984):
     // unsupplied tuples read as NULL, whole-record use is SQL NULL.
     let empty_rv = crate::exec::RecValue {
-        desc: std::rc::Rc::new(desc.clone()),
+        desc: desc.clone(),
         values: vec![Datum::null(); natts],
         nulls: vec![true; natts],
         src_desc: Some(src_desc),
@@ -2043,6 +2123,12 @@ fn plpgsql_exec_trigger(
             }
         }
     };
+    // pl_exec.c:1107-1128: a returned NEW or OLD that still holds its bound
+    // tuple is returned as a copy of that tuple (SPI_copytuple), without
+    // rebuilding it field by field.
+    if let Some(image) = unchanged_trigger_row(&estate, func, &rv, &desc) {
+        return copy_trigger_row(fcinfo.result_mcx(), image, rel.rd_id);
+    }
     // build_attrmap_by_position + execute_attr_map_tuple: map the returned
     // row onto the relation rowtype (typmod-aware position walk).
     let (values, nulls) = match map_returned_row(&rv, &desc) {
