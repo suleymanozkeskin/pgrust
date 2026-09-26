@@ -9,6 +9,7 @@ name = "spi"
 path = "src/lib.rs"
 
 [dependencies]
+ipc_seams = { path = "../../storage/ipc/ipc_seams" }
 queryenvironment = { path = "../../utils/misc/queryenvironment" }
 tuplestore = { path = "../../utils/sort/tuplestore" }
 types_trigger_call = { path = "../../../_support/types/types_trigger_call" }
@@ -78,7 +79,6 @@ guc_tables = { path = "../../utils/misc/guc_tables" }
 heapam_visibility = { path = "../../access/heap/heapam_visibility" }
 init_small = { path = "../../utils/init/init_small" }
 inval = { path = "../../utils/cache/inval" }
-ipc_seams = { path = "../../storage/ipc/ipc_seams" }
 latch_seams = { path = "../../storage/ipc/latch_seams" }
 lmgr_proc = { path = "../../storage/lmgr/lmgr_proc" }
 lmgr_seams = { path = "../../storage/lmgr/lmgr_seams" }

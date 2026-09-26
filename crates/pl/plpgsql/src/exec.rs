@@ -98,36 +98,133 @@ fn deform_tuptable_row(t: &spi::TuptabData<'_>, i: usize, values: &mut [Datum], 
     }
 }
 
-pub(crate) struct Ctx(*mut MemoryContext);
+pub(crate) struct Ctx {
+    context: *mut MemoryContext,
+    release: CtxRelease,
+}
+
+// What happens to a Ctx's context when the Ctx drops.
+#[derive(Clone, Copy)]
+enum CtxRelease {
+    Drop,
+    // Reset and kept for the next call on this thread (CallContextPool).
+    Pool(CallContextKind),
+}
+
+// The per-call contexts that CallContextPool keeps, one list per kind.
+#[derive(Clone, Copy)]
+enum CallContextKind {
+    // C's datum_context (plpgsql_estate_setup, pl_exec.c:4027: the SPI
+    // procedure context, an AllocSet): values are pfree'd one at a time on
+    // reassignment, so the backend must give chunks back. Its reset is
+    // wholesale, like the delete at the end of a call in C.
+    Values,
+    // C's eval_mcontext: reset-wholesale scratch.
+    Scratch,
+}
+
+impl CallContextKind {
+    fn create(self) -> MemoryContext {
+        match self {
+            CallContextKind::Values => MemoryContext::new_wholesale("PLpgSQL per-invocation values"),
+            CallContextKind::Scratch => MemoryContext::new_bump("PLpgSQL eval scratch"),
+        }
+    }
+}
+
+// Per-call contexts of finished calls, reset, kept for the next call on this
+// thread (C: aset.c context_freelists keeps deleted contexts for reuse).
+// Bounded by POOLED_CALL_CONTEXTS per kind; emptied by
+// release_plpgsql_state_at_exit.
+struct CallContextPool {
+    values: Vec<*mut MemoryContext>,
+    scratch: Vec<*mut MemoryContext>,
+}
+
+const POOLED_CALL_CONTEXTS: usize = 8;
+
+impl CallContextPool {
+    fn list(&mut self, kind: CallContextKind) -> &mut Vec<*mut MemoryContext> {
+        match kind {
+            CallContextKind::Values => &mut self.values,
+            CallContextKind::Scratch => &mut self.scratch,
+        }
+    }
+}
+
+impl Drop for CallContextPool {
+    // Also the fallback for a thread that ends without the exit chain.
+    fn drop(&mut self) {
+        for context in self.values.drain(..).chain(self.scratch.drain(..)) {
+            // SAFETY: Box::into_raw provenance; the pool is the only owner.
+            drop(unsafe { Box::from_raw(context) });
+        }
+    }
+}
+
+std::thread_local! {
+    static CALL_CONTEXT_POOL: core::cell::RefCell<CallContextPool> =
+        const { core::cell::RefCell::new(CallContextPool { values: Vec::new(), scratch: Vec::new() }) };
+}
+
+fn release_call_context_pool() {
+    let pool = CALL_CONTEXT_POOL.with(|pool| {
+        let mut pool = pool.borrow_mut();
+        CallContextPool {
+            values: core::mem::take(&mut pool.values),
+            scratch: core::mem::take(&mut pool.scratch),
+        }
+    });
+    drop(pool);
+}
 
 impl Ctx {
     // Reset-wholesale scratch (C's eval_mcontext / stmt_mcontext discipline).
     pub fn new(name: &'static str) -> Ctx {
-        Ctx(Box::into_raw(Box::new(MemoryContext::new_bump(name))))
+        Ctx { context: Box::into_raw(Box::new(MemoryContext::new_bump(name))), release: CtxRelease::Drop }
     }
-    // C's datum_context (plpgsql_estate_setup, pl_exec.c:4027: the SPI
-    // procedure context, an AllocSet): values are pfree'd one at a time on
-    // reassignment, so the backend must give chunks back. Never reset()
-    // (the aset reset asserts nothing is still charged); dropped with the
-    // estate.
-    pub fn new_aset(name: &'static str) -> Ctx {
-        Ctx(Box::into_raw(Box::new(MemoryContext::new(name))))
+    // A per-call context of `kind`, reused from this thread's pool when one
+    // is there.
+    fn for_call(kind: CallContextKind) -> Ctx {
+        register_exit_release();
+        let pooled = CALL_CONTEXT_POOL.with(|pool| pool.borrow_mut().list(kind).pop());
+        let context = pooled.unwrap_or_else(|| Box::into_raw(Box::new(kind.create())));
+        Ctx { context, release: CtxRelease::Pool(kind) }
     }
     pub fn mcx(&self) -> Mcx<'static> {
         // SAFETY: reclaimed only in Drop; handles do not outlive the estate.
-        unsafe { (*self.0).mcx() }
+        unsafe { (*self.context).mcx() }
     }
     pub fn reset(&self) {
         // SAFETY: as above; no live borrows at reset points (allocations are
         // raw datums, invalidated by contract like C's context reset).
-        unsafe { (*self.0).reset() }
+        unsafe { (*self.context).reset() }
     }
 }
 
 impl Drop for Ctx {
     fn drop(&mut self) {
-        // SAFETY: Box::into_raw provenance.
-        drop(unsafe { Box::from_raw(self.0) });
+        match self.release {
+            CtxRelease::Drop => {
+                // SAFETY: Box::into_raw provenance.
+                drop(unsafe { Box::from_raw(self.context) });
+            }
+            CtxRelease::Pool(kind) => {
+                self.reset();
+                let mut context = Some(self.context);
+                let _ = CALL_CONTEXT_POOL.try_with(|pool| {
+                    let mut pool = pool.borrow_mut();
+                    let list = pool.list(kind);
+                    if list.len() < POOLED_CALL_CONTEXTS {
+                        list.push(context.take().expect("taken once"));
+                    }
+                });
+                if let Some(context) = context {
+                    // SAFETY: Box::into_raw provenance; not pooled.
+                    drop(unsafe { Box::from_raw(context) });
+                }
+            }
+        }
     }
 }
 
@@ -668,6 +765,7 @@ fn release_plpgsql_state_at_exit(_code: i32, _arg: usize) {
         spi::SPI_freeplan(plan);
     }
     CALL_TARGETS.with(|t| t.borrow_mut().clear());
+    release_call_context_pool();
     EXIT_RELEASE_REGISTERED.with(|c| c.set(false));
 }
 
@@ -1045,8 +1143,8 @@ impl<'a> Estate<'a> {
             readonly_func,
             atomic,
             cast_cache: FxHashMap::default(),
-            datum_ctx: Ctx::new_aset("PLpgSQL per-invocation values"),
-            eval_ctx: Ctx::new("PLpgSQL eval scratch"),
+            datum_ctx: Ctx::for_call(CallContextKind::Values),
+            eval_ctx: Ctx::for_call(CallContextKind::Scratch),
             var_type_overrides: FxHashMap::default(),
             rec_type_overrides: FxHashMap::default(),
             rec_origins: Vec::new(),

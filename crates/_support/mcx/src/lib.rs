@@ -1097,6 +1097,15 @@ impl MemoryContext {
         Self::with_backend(name, Backend::Bump(new_arena()), None)
     }
 
+    /// A root AllocSet whose reset is wholesale like C's AllocSetReset: live
+    /// chunks are dropped, not reported as leaks (the root form of
+    /// new_child_wholesale).
+    pub fn new_wholesale(name: &'static str) -> Self {
+        let ctx = Self::new(name);
+        ctx.acct.wholesale_reset.set(true);
+        ctx
+    }
+
     pub fn new_child(&self, name: &'static str) -> MemoryContext {
         Self::with_backend(
             name,
