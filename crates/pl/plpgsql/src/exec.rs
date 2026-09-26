@@ -309,6 +309,18 @@ struct DeclaredShape {
     desc: std::rc::Rc<RecDesc>,
 }
 
+// A copy of a query result descriptor with its RecDesc, shared by every record
+// value assigned from an equal descriptor during one call.
+struct RecordShape {
+    tupdesc: std::rc::Rc<types_tuple::TupleDescData<'static>>,
+    desc: std::rc::Rc<RecDesc>,
+}
+
+// Result descriptor copies of one call, newest last; at most
+// RECORD_SHAPES_PER_CALL entries, the oldest is replaced first. The copies
+// live in the call's datum context, so the cache must drop before it.
+const RECORD_SHAPES_PER_CALL: usize = 8;
+
 // The result of exec_move_row's no-coercion test.
 enum RowMove {
     Stored,
@@ -896,6 +908,9 @@ pub struct Estate<'a> {
     pub readonly_func: bool,
     pub atomic: bool,
     cast_cache: FxHashMap<(Oid, i32, Oid, i32), CastEntry>,
+    // Result descriptor copies (see RecordShape); declared before datum_ctx,
+    // which holds their memory.
+    record_shapes: Vec<RecordShape>,
     // Invocation-lifetime var values (C's "procedure" context).
     datum_ctx: Ctx,
     // Per-evaluation scratch (C's eval_mcontext); reset by exec_eval_cleanup.
@@ -1143,6 +1158,7 @@ impl<'a> Estate<'a> {
             readonly_func,
             atomic,
             cast_cache: FxHashMap::default(),
+            record_shapes: Vec::new(),
             datum_ctx: Ctx::for_call(CallContextKind::Values),
             eval_ctx: Ctx::for_call(CallContextKind::Scratch),
             var_type_overrides: FxHashMap::default(),
@@ -3660,7 +3676,7 @@ impl<'a> Estate<'a> {
                     }
                     None => Some(sys),
                 };
-                self.move_rec_from_values(target, &desc, src, &values, &nulls, sys, true, true)
+                self.move_rec_from_values(target, &std::rc::Rc::new(desc), src, &values, &nulls, sys, true, true)
             }
             PlDatum::Row(r) => {
                 let varnos = r.varnos.clone();
@@ -4017,11 +4033,34 @@ impl<'a> Estate<'a> {
         Ok(())
     }
 
-    fn rec_desc_of(&self, tuptab: TuptabHandle) -> PgResult<(RecDesc, std::rc::Rc<types_tuple::TupleDescData<'static>>)> {
+    // A copy of the tuple table's descriptor with its RecDesc. An earlier copy
+    // of an equal descriptor from this call is reused (TupleDescMatchesCopy);
+    // otherwise the descriptor is copied into the datum context and cached.
+    fn rec_desc_of(
+        &mut self,
+        tuptab: TuptabHandle,
+    ) -> PgResult<(std::rc::Rc<RecDesc>, std::rc::Rc<types_tuple::TupleDescData<'static>>)> {
+        let shapes = &self.record_shapes;
+        let found = spi::tuptable_with(tuptab, |t| {
+            shapes.iter().position(|shape| tupdesc::TupleDescMatchesCopy(&shape.tupdesc, &t.tupdesc))
+        });
+        if let Some(i) = found {
+            let shape = &self.record_shapes[i];
+            return Ok((shape.desc.clone(), shape.tupdesc.clone()));
+        }
         let td = spi::tuptable_with(tuptab, |t| {
             tupdesc::CreateTupleDescCopy(self.datum_ctx.mcx(), &t.tupdesc)
         })?;
-        Ok((RecDesc::from_tupdesc(&td), std::rc::Rc::new(td)))
+        let shape = RecordShape {
+            desc: std::rc::Rc::new(RecDesc::from_tupdesc(&td)),
+            tupdesc: std::rc::Rc::new(td),
+        };
+        let result = (shape.desc.clone(), shape.tupdesc.clone());
+        if self.record_shapes.len() == RECORD_SHAPES_PER_CALL {
+            self.record_shapes.remove(0);
+        }
+        self.record_shapes.push(shape);
+        Ok(result)
     }
 
     // exec_move_row with a NULL source tuple.
@@ -4182,7 +4221,7 @@ impl<'a> Estate<'a> {
     fn move_rec_from_values(
         &mut self,
         recno: Dno,
-        srcdesc: &RecDesc,
+        srcdesc: &std::rc::Rc<RecDesc>,
         src_tupdesc: std::rc::Rc<types_tuple::TupleDescData<'static>>,
         values: &[Datum],
         nulls: &[bool],
@@ -4215,7 +4254,7 @@ impl<'a> Estate<'a> {
             self.assign_record_var(
                 recno,
                 Some(RecValue {
-                    desc: std::rc::Rc::new(srcdesc.clone()),
+                    desc: srcdesc.clone(),
                     values: out_values,
                     nulls: nulls.to_vec(),
                     src_desc: Some(src_tupdesc),

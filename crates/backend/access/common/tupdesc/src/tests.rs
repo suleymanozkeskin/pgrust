@@ -709,3 +709,31 @@ fn convert_tuples_by_name_attrmap_is_identity() {
     let wrapped = convert_tuples_by_name_attrmap(&indesc, &outdesc, attmap);
     assert_eq!(&wrapped[..], &expected[..]);
 }
+
+// TupleDescMatchesCopy: a copy matches its source, also when the source has
+// constraint fields that the copy clears; any other difference does not match.
+#[test]
+fn matches_copy_ignores_only_cleared_fields() {
+    install_seams();
+    let ctx = MemoryContext::new("t");
+    let mut src = two_col_desc(ctx.mcx());
+    src.attr_mut(0).attnotnull = true;
+    src.attr_mut(1).atthasdef = true;
+    let copy = CreateTupleDescCopy(ctx.mcx(), &src).unwrap();
+    assert!(TupleDescMatchesCopy(&copy, &src));
+
+    let mut other = two_col_desc(ctx.mcx());
+    other.attr_mut(1).atttypmod = 99;
+    assert!(!TupleDescMatchesCopy(&copy, &other));
+
+    let mut renamed = two_col_desc(ctx.mcx());
+    renamed.attr_mut(0).attname.namestrcpy("other");
+    assert!(!TupleDescMatchesCopy(&copy, &renamed));
+
+    let mut typed = two_col_desc(ctx.mcx());
+    typed.tdtypmod = 7;
+    assert!(!TupleDescMatchesCopy(&copy, &typed));
+
+    let short = CreateTupleDescTruncatedCopy(ctx.mcx(), &src, 1).unwrap();
+    assert!(!TupleDescMatchesCopy(&short, &src));
+}

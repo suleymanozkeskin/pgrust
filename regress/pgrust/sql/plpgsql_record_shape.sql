@@ -1,0 +1,105 @@
+--
+-- PL/pgSQL RECORD variables assigned from query rows of the same and of
+-- different shapes during one call: column names, types, typmods, and
+-- values must follow each row, never an earlier row of another shape.
+--
+
+CREATE TABLE prec_a (id integer, name text, n numeric(6,2));
+CREATE TABLE prec_b (id integer, label varchar(5), flag boolean);
+INSERT INTO prec_a VALUES (1, 'a1', 1.25), (2, NULL, 2.50), (3, 'a3', NULL);
+INSERT INTO prec_b VALUES (1, 'b1', true), (2, 'b2', false);
+
+-- One record, alternating shapes in a loop.
+CREATE FUNCTION prec_alternate() RETURNS text LANGUAGE plpgsql AS $$
+DECLARE r record; acc text := '';
+BEGIN
+    FOR i IN 1..4 LOOP
+        IF i % 2 = 1 THEN
+            SELECT * INTO r FROM prec_a WHERE id = i;
+            acc := acc || format('[%s %s %s]', r.id, r.name, r.n);
+        ELSE
+            SELECT * INTO r FROM prec_b WHERE id = i / 2;
+            acc := acc || format('[%s %s %s]', r.id, r.label, r.flag);
+        END IF;
+    END LOOP;
+    RETURN acc;
+END $$;
+SELECT prec_alternate();
+
+-- Same column types, different column names.
+CREATE FUNCTION prec_names() RETURNS text LANGUAGE plpgsql AS $$
+DECLARE r record; out text;
+BEGIN
+    SELECT 1 AS x, 'one'::text AS y INTO r;
+    out := r.x || r.y;
+    SELECT 2 AS p, 'two'::text AS q INTO r;
+    out := out || ' ' || r.p || r.q;
+    BEGIN
+        out := out || r.x;
+    EXCEPTION WHEN undefined_column THEN
+        out := out || ' (no x)';
+    END;
+    RETURN out;
+END $$;
+SELECT prec_names();
+
+-- Same names and types, different typmods.
+CREATE FUNCTION prec_typmods() RETURNS text LANGUAGE plpgsql AS $$
+DECLARE r record; out text := '';
+BEGIN
+    SELECT 'abc'::varchar(3) AS v INTO r;
+    out := pg_typeof(r.v)::text || ':' || r.v;
+    SELECT 'abcde'::varchar(5) AS v INTO r;
+    out := out || ' ' || pg_typeof(r.v)::text || ':' || r.v;
+    RETURN out || ' ' || r::text;
+END $$;
+SELECT prec_typmods();
+
+-- Two records assigned from the same statement shape keep separate values.
+CREATE FUNCTION prec_two() RETURNS text LANGUAGE plpgsql AS $$
+DECLARE r1 record; r2 record;
+BEGIN
+    SELECT * INTO r1 FROM prec_a WHERE id = 1;
+    SELECT * INTO r2 FROM prec_a WHERE id = 3;
+    r1.name := 'changed';
+    RETURN r1::text || ' ' || r2::text;
+END $$;
+SELECT prec_two();
+
+-- FOR loops over many rows and several shapes, more shapes than a small
+-- cache holds.
+CREATE FUNCTION prec_many_shapes() RETURNS text LANGUAGE plpgsql AS $$
+DECLARE r record; acc text := '';
+BEGIN
+    FOR k IN 1..12 LOOP
+        EXECUTE format('SELECT %s AS c%s, repeat(''x'', %s) AS t%s', k, k, k, k) INTO r;
+        acc := acc || r::text;
+    END LOOP;
+    FOR r IN SELECT * FROM prec_a ORDER BY id LOOP
+        acc := acc || coalesce(r.name, '-');
+    END LOOP;
+    FOR r IN SELECT * FROM prec_b ORDER BY id LOOP
+        acc := acc || r.label;
+    END LOOP;
+    RETURN acc;
+END $$;
+SELECT prec_many_shapes();
+
+-- RETURN of a record from a function returning a composite type.
+CREATE FUNCTION prec_return(p integer) RETURNS prec_a LANGUAGE plpgsql AS $$
+DECLARE r record;
+BEGIN
+    SELECT * INTO r FROM prec_a WHERE id = p;
+    RETURN r;
+END $$;
+SELECT * FROM prec_return(2);
+SELECT * FROM prec_return(99);
+
+-- A row with a column dropped from the source table.
+ALTER TABLE prec_a DROP COLUMN name;
+SELECT prec_two();
+SELECT * FROM prec_return(1);
+
+DROP FUNCTION prec_alternate(), prec_names(), prec_typmods(), prec_two(),
+    prec_many_shapes(), prec_return(integer);
+DROP TABLE prec_a, prec_b;
