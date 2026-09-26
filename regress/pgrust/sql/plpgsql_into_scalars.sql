@@ -1,0 +1,101 @@
+--
+-- PL/pgSQL assignment of query results to a list of scalar variables:
+-- column types, dropped columns, wide rows, NOT NULL targets, and
+-- INOUT procedure parameters.
+--
+
+CREATE TABLE pis_t (
+    id integer PRIMARY KEY,
+    a text, b bigint, c numeric(10,2), d varchar(4), e boolean
+);
+INSERT INTO pis_t VALUES
+    (1, 'one', 10, 1.50, 'abcd', true),
+    (2, NULL, NULL, NULL, NULL, NULL);
+
+-- Source column types differ from the target types (casts per field).
+CREATE FUNCTION pis_cast(p integer) RETURNS text LANGUAGE plpgsql AS $$
+DECLARE x bigint; y text; z integer; w varchar(4);
+BEGIN
+    SELECT id, b, c, d INTO x, y, z, w FROM pis_t WHERE id = p;
+    RETURN format('%s|%s|%s|%s', x, y, z, w);
+END $$;
+SELECT pis_cast(1), pis_cast(2), pis_cast(3);
+-- A cast to a shorter varchar fails.
+CREATE FUNCTION pis_cast_short() RETURNS text LANGUAGE plpgsql AS $$
+DECLARE w varchar(2);
+BEGIN
+    SELECT d INTO w FROM pis_t WHERE id = 1;
+    RETURN w;
+END $$;
+SELECT pis_cast_short();
+
+-- More than eight source columns.
+CREATE FUNCTION pis_wide() RETURNS text LANGUAGE plpgsql AS $$
+DECLARE v1 int; v2 int; v3 int; v4 int; v5 int; v6 int; v7 int; v8 int;
+        v9 int; v10 text; v11 int;
+BEGIN
+    SELECT 1, 2, 3, 4, 5, 6, 7, 8, 9, 'ten', NULL
+      INTO v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11;
+    RETURN format('%s %s %s %s %s %s %s %s %s %s %s',
+                  v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11 IS NULL);
+END $$;
+SELECT pis_wide();
+
+-- Dropped columns in the source row are skipped.
+ALTER TABLE pis_t DROP COLUMN b;
+CREATE FUNCTION pis_dropped(p integer) RETURNS text LANGUAGE plpgsql AS $$
+DECLARE i integer; s text; n numeric; q text; f boolean;
+BEGIN
+    SELECT * INTO i, s, n, q, f FROM pis_t WHERE id = p;
+    RETURN format('%s|%s|%s|%s|%s', i, s, n, q, f);
+END $$;
+SELECT pis_dropped(1), pis_dropped(2);
+
+-- A NOT NULL variable rejects a NULL column and names the variable.
+CREATE FUNCTION pis_notnull(p integer) RETURNS text LANGUAGE plpgsql AS $$
+DECLARE s text NOT NULL := 'init'; i integer;
+BEGIN
+    SELECT id, a INTO i, s FROM pis_t WHERE id = p;
+    RETURN s;
+END $$;
+SELECT pis_notnull(1);
+SELECT pis_notnull(2);
+
+-- Plain scalar assignment into a NOT NULL variable reports the same error.
+CREATE FUNCTION pis_notnull_assign() RETURNS text LANGUAGE plpgsql AS $$
+DECLARE target_value integer NOT NULL := 1;
+BEGIN
+    target_value := NULL;
+    RETURN target_value;
+END $$;
+SELECT pis_notnull_assign();
+
+-- INOUT procedure parameters assigned to a variable list.
+CREATE PROCEDURE pis_proc(INOUT x integer, INOUT y text) LANGUAGE plpgsql AS $$
+BEGIN
+    x := x * 2;
+    y := y || '!';
+END $$;
+CREATE FUNCTION pis_call() RETURNS text LANGUAGE plpgsql AS $$
+DECLARE a integer := 21; b text := 'hi';
+BEGIN
+    CALL pis_proc(a, b);
+    RETURN format('%s|%s', a, b);
+END $$;
+SELECT pis_call();
+
+-- FOR loop over a query into a scalar list.
+CREATE FUNCTION pis_loop() RETURNS text LANGUAGE plpgsql AS $$
+DECLARE i integer; s text; acc text := '';
+BEGIN
+    FOR i, s IN SELECT id, coalesce(a, '-') FROM pis_t ORDER BY id LOOP
+        acc := acc || i || '=' || s || ';';
+    END LOOP;
+    RETURN acc;
+END $$;
+SELECT pis_loop();
+
+DROP FUNCTION pis_cast(integer), pis_cast_short(), pis_wide(), pis_dropped(integer),
+    pis_notnull(integer), pis_notnull_assign(), pis_call(), pis_loop();
+DROP PROCEDURE pis_proc(integer, text);
+DROP TABLE pis_t;
