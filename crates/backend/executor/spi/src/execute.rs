@@ -343,7 +343,7 @@ pub(crate) fn _SPI_execute_plan(
         }
 
         for &(psrc, stmt_index) in &plan.sources {
-            errctx.set_query(plancache::CachedPlanQueryString(psrc));
+            errctx.set_source_query(plancache::CachedPlanQueryString(psrc));
 
             if plan.oneshot {
                 plan::complete_source(psrc, stmt_index, &plan.argtypes, plan.cursor_options)?;

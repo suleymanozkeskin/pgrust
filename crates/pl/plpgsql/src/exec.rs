@@ -1022,7 +1022,11 @@ pub struct FrameShared {
 
 enum CtxFrame {
     Pl(std::rc::Rc<FrameShared>),
-    Spi(String),
+    // The statement text and parse mode; the context line is formatted only
+    // when the stack is read (GET DIAGNOSTICS ... PG_CONTEXT), as C's
+    // _SPI_error_callback formats only when it runs. The text is borrowed:
+    // FrameGuard's lifetime ties the frame to it (see push_spi).
+    Spi { query: *const str, mode: parser_seams::RawParseMode },
 }
 
 std::thread_local! {
@@ -1030,10 +1034,12 @@ std::thread_local! {
         const { core::cell::RefCell::new(Vec::new()) };
 }
 
-pub struct FrameGuard(Option<u64>);
+// Pops its CONTEXT_FRAMES entry on drop. `'q` is the lifetime of the
+// statement text an SPI frame borrows; a PL frame borrows nothing ('static).
+pub struct FrameGuard<'q>(Option<u64>, core::marker::PhantomData<&'q str>);
 
-impl FrameGuard {
-    pub fn push_pl(estate: &Estate<'_>) -> FrameGuard {
+impl FrameGuard<'static> {
+    pub fn push_pl(estate: &Estate<'_>) -> FrameGuard<'static> {
         let f = estate.frame.clone();
         // C's errfinish walks error_context_stack for every elevel: notices
         // and warnings emitted while this frame is live carry its context
@@ -1045,21 +1051,25 @@ impl FrameGuard {
             }))
         };
         CONTEXT_FRAMES.with(|s| s.borrow_mut().push(CtxFrame::Pl(f)));
-        FrameGuard(Some(cb))
+        FrameGuard(Some(cb), core::marker::PhantomData)
     }
+}
 
+impl<'q> FrameGuard<'q> {
     // The SPI level's own _SPI_error_callback frame (spi crate
     // SpiErrorContext, pushed by SPI_prepare*/SPI_execute*/SPI_cursor_open*)
     // describes reports raised under it; this frame only mirrors it for
     // GET DIAGNOSTICS PG_CONTEXT (get_error_context_stack).
-    fn push_spi(query: &str, mode: parser_seams::RawParseMode) -> FrameGuard {
-        let line = spi_context_line(query, mode);
-        CONTEXT_FRAMES.with(|s| s.borrow_mut().push(CtxFrame::Spi(line)));
-        FrameGuard(None)
+    // The frame holds a pointer to `query`; the guard borrows `query` for
+    // 'q and removes the frame when dropped, so the pointer is valid for as
+    // long as the frame is on the stack.
+    fn push_spi(query: &'q str, mode: parser_seams::RawParseMode) -> FrameGuard<'q> {
+        CONTEXT_FRAMES.with(|s| s.borrow_mut().push(CtxFrame::Spi { query: query as *const str, mode }));
+        FrameGuard(None, core::marker::PhantomData)
     }
 }
 
-impl Drop for FrameGuard {
+impl Drop for FrameGuard<'_> {
     fn drop(&mut self) {
         if let Some(cb) = self.0 {
             elog::pop_emit_context_callback(cb);
@@ -1081,7 +1091,12 @@ fn get_error_context_stack() -> String {
             }
             match frame {
                 CtxFrame::Pl(f) => out.push_str(&frame_context_line_of(f)),
-                CtxFrame::Spi(line) => out.push_str(line),
+                CtxFrame::Spi { query, mode } => {
+                    // SAFETY: the FrameGuard that pushed this frame borrows
+                    // the text and is still alive (it pops the frame on drop).
+                    let query = unsafe { &**query };
+                    out.push_str(&spi_context_line(query, *mode));
+                }
             }
         }
         out

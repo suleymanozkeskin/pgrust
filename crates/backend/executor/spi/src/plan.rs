@@ -148,18 +148,40 @@ pub(crate) fn spi_error_callback(query: &str, mode: RawParseMode, e: &mut types_
 // so the level transposes it on the Err path instead — once per level, as C
 // runs the callback once per stack frame.
 pub(crate) struct SpiErrorContext {
-    query: Rc<RefCell<Option<String>>>,
+    query: Rc<RefCell<SpiQueryText>>,
     mode: RawParseMode,
     callback: u64,
 }
 
+// The statement text the level reports under (C spicallbackarg.query).
+enum SpiQueryText {
+    // No plansource named yet: the callback is silent.
+    Unset,
+    // A plansource's query_string (CachedPlanQueryString), borrowed as C
+    // borrows plansource->query_string: plan execution and cursor open
+    // install it for each statement, and the source outlives the level.
+    Source(&'static str),
+    // Text given to a prepare call, copied once per prepare.
+    Copied(String),
+}
+
+impl SpiQueryText {
+    fn text(&self) -> Option<&str> {
+        match self {
+            SpiQueryText::Unset => None,
+            SpiQueryText::Source(q) => Some(q),
+            SpiQueryText::Copied(q) => Some(q),
+        }
+    }
+}
+
 impl SpiErrorContext {
     pub(crate) fn push(mode: RawParseMode) -> SpiErrorContext {
-        let query: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
+        let query = Rc::new(RefCell::new(SpiQueryText::Unset));
         let callback = {
             let query = Rc::clone(&query);
             elog::push_emit_context_callback(Box::new(move |e| {
-                if let Some(q) = query.borrow().as_deref() {
+                if let Some(q) = query.borrow().text() {
                     spi_error_callback(q, mode, e);
                 }
             }))
@@ -167,12 +189,19 @@ impl SpiErrorContext {
         SpiErrorContext { query, mode, callback }
     }
 
+    // A prepare call's text: copied, since the caller's string may not
+    // outlive the level.
     pub(crate) fn set_query(&self, query: &str) {
-        *self.query.borrow_mut() = Some(query.to_owned());
+        *self.query.borrow_mut() = SpiQueryText::Copied(query.to_owned());
+    }
+
+    // A plansource's query_string: borrowed, no copy per execution.
+    pub(crate) fn set_source_query(&self, query: &'static str) {
+        *self.query.borrow_mut() = SpiQueryText::Source(query);
     }
 
     pub(crate) fn transpose(&self, mut e: Box<types_error::PgError>) -> Box<types_error::PgError> {
-        if let Some(q) = self.query.borrow().as_deref() {
+        if let Some(q) = self.query.borrow().text() {
             spi_error_callback(q, self.mode, &mut e);
         }
         e

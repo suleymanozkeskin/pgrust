@@ -1,0 +1,161 @@
+--
+-- Context lines of reports raised inside SQL statements run by PL/pgSQL:
+-- GET DIAGNOSTICS PG_CONTEXT, notices, errors with and without a cursor
+-- position, cursors, and dynamic SQL.
+--
+\set SHOW_CONTEXT always
+CREATE TABLE pec_t (id integer PRIMARY KEY, v text);
+INSERT INTO pec_t VALUES (1, 'one'), (2, 'two');
+CREATE FUNCTION pec_inner() RETURNS text LANGUAGE plpgsql AS $$
+DECLARE ctx text;
+BEGIN
+    GET DIAGNOSTICS ctx = PG_CONTEXT;
+    RAISE NOTICE 'inner context: %', ctx;
+    RETURN 'ok';
+END $$;
+CREATE FUNCTION pec_outer() RETURNS text LANGUAGE plpgsql AS $$
+DECLARE r text;
+BEGIN
+    -- a long statement: the context line must carry its full text
+    SELECT pec_inner() || '/' || v INTO r FROM pec_t WHERE id = 1 AND v <> 'a long comparison value that makes this statement text longer than usual';
+    PERFORM pec_inner();
+    r := r || '/' || pec_inner();
+    RETURN r;
+END $$;
+SELECT pec_outer();
+NOTICE:  inner context: PL/pgSQL function pec_inner() line 4 at GET DIAGNOSTICS
+SQL statement "SELECT pec_inner() || '/' || v        FROM pec_t WHERE id = 1 AND v <> 'a long comparison value that makes this statement text longer than usual'"
+PL/pgSQL function pec_outer() line 5 at SQL statement
+CONTEXT:  PL/pgSQL function pec_inner() line 5 at RAISE
+SQL statement "SELECT pec_inner() || '/' || v        FROM pec_t WHERE id = 1 AND v <> 'a long comparison value that makes this statement text longer than usual'"
+PL/pgSQL function pec_outer() line 5 at SQL statement
+NOTICE:  inner context: PL/pgSQL function pec_inner() line 4 at GET DIAGNOSTICS
+SQL statement "SELECT pec_inner()"
+PL/pgSQL function pec_outer() line 6 at PERFORM
+CONTEXT:  PL/pgSQL function pec_inner() line 5 at RAISE
+SQL statement "SELECT pec_inner()"
+PL/pgSQL function pec_outer() line 6 at PERFORM
+NOTICE:  inner context: PL/pgSQL function pec_inner() line 4 at GET DIAGNOSTICS
+PL/pgSQL function pec_outer() line 7 at assignment
+CONTEXT:  PL/pgSQL function pec_inner() line 5 at RAISE
+PL/pgSQL function pec_outer() line 7 at assignment
+ pec_outer 
+-----------
+ ok/one/ok
+(1 row)
+
+-- Notices raised by a function called from inside a query.
+CREATE FUNCTION pec_notice(p integer) RETURNS integer LANGUAGE plpgsql AS $$
+BEGIN
+    RAISE NOTICE 'row %', p;
+    RETURN p;
+END $$;
+CREATE FUNCTION pec_query_notices() RETURNS integer LANGUAGE plpgsql AS $$
+DECLARE n integer;
+BEGIN
+    SELECT sum(pec_notice(id)) INTO n FROM pec_t;
+    RETURN n;
+END $$;
+SELECT pec_query_notices();
+NOTICE:  row 1
+CONTEXT:  PL/pgSQL function pec_notice(integer) line 3 at RAISE
+SQL statement "SELECT sum(pec_notice(id))        FROM pec_t"
+PL/pgSQL function pec_query_notices() line 4 at SQL statement
+NOTICE:  row 2
+CONTEXT:  PL/pgSQL function pec_notice(integer) line 3 at RAISE
+SQL statement "SELECT sum(pec_notice(id))        FROM pec_t"
+PL/pgSQL function pec_query_notices() line 4 at SQL statement
+ pec_query_notices 
+-------------------
+                 3
+(1 row)
+
+-- Errors inside statements: runtime error, error with a position, and a
+-- caught error followed by the same statement again.
+CREATE FUNCTION pec_div(p integer) RETURNS integer LANGUAGE plpgsql AS $$
+DECLARE n integer;
+BEGIN
+    SELECT 10 / p INTO n FROM pec_t WHERE id = 1;
+    RETURN n;
+END $$;
+SELECT pec_div(0);
+ERROR:  division by zero
+CONTEXT:  SQL statement "SELECT 10 / p        FROM pec_t WHERE id = 1"
+PL/pgSQL function pec_div(integer) line 4 at SQL statement
+SELECT pec_div(5);
+ pec_div 
+---------
+       2
+(1 row)
+
+CREATE FUNCTION pec_badcol() RETURNS integer LANGUAGE plpgsql AS $$
+DECLARE n integer;
+BEGIN
+    SELECT no_such_column INTO n FROM pec_t;
+    RETURN n;
+END $$;
+SELECT pec_badcol();
+ERROR:  column "no_such_column" does not exist
+LINE 1: SELECT no_such_column        FROM pec_t
+               ^
+QUERY:  SELECT no_such_column        FROM pec_t
+CONTEXT:  PL/pgSQL function pec_badcol() line 4 at SQL statement
+CREATE FUNCTION pec_caught() RETURNS text LANGUAGE plpgsql AS $$
+DECLARE acc text := '';
+BEGIN
+    FOR i IN 0..2 LOOP
+        BEGIN
+            acc := acc || pec_div(i) || ' ';
+        EXCEPTION WHEN division_by_zero THEN
+            acc := acc || 'div0 ';
+        END;
+    END LOOP;
+    RETURN acc;
+END $$;
+SELECT pec_caught();
+ pec_caught 
+------------
+ div0 10 5 
+(1 row)
+
+-- Cursors and dynamic SQL.
+CREATE FUNCTION pec_cursor() RETURNS text LANGUAGE plpgsql AS $$
+DECLARE c refcursor; r record; acc text := '';
+BEGIN
+    OPEN c FOR SELECT id, 10 / (id - 2) AS q FROM pec_t ORDER BY id;
+    LOOP
+        FETCH c INTO r;
+        EXIT WHEN NOT FOUND;
+        acc := acc || r.q || ' ';
+    END LOOP;
+    CLOSE c;
+    RETURN acc;
+END $$;
+SELECT pec_cursor();
+ERROR:  division by zero
+CONTEXT:  PL/pgSQL function pec_cursor() line 6 at FETCH
+CREATE FUNCTION pec_dynamic(q text) RETURNS integer LANGUAGE plpgsql AS $$
+DECLARE n integer;
+BEGIN
+    EXECUTE q INTO n;
+    RETURN n;
+END $$;
+SELECT pec_dynamic('SELECT count(*) FROM pec_t');
+ pec_dynamic 
+-------------
+           2
+(1 row)
+
+SELECT pec_dynamic('SELECT 1 / 0');
+ERROR:  division by zero
+CONTEXT:  SQL statement "SELECT 1 / 0"
+PL/pgSQL function pec_dynamic(text) line 4 at EXECUTE
+SELECT pec_dynamic('SELECT nope FROM pec_t');
+ERROR:  column "nope" does not exist
+LINE 1: SELECT nope FROM pec_t
+               ^
+QUERY:  SELECT nope FROM pec_t
+CONTEXT:  PL/pgSQL function pec_dynamic(text) line 4 at EXECUTE
+DROP FUNCTION pec_outer(), pec_inner(), pec_notice(integer), pec_query_notices(),
+    pec_div(integer), pec_badcol(), pec_caught(), pec_cursor(), pec_dynamic(text);
+DROP TABLE pec_t;
