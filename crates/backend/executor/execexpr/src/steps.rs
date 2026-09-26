@@ -708,13 +708,13 @@ pub enum Step {
         transno: u16,
     },
     // C EEOP_FIELDSELECT; reads the record datum from `out`, writes the
-    // field back to `out`. Per-eval registry tupdesc copy stands in for C's
-    // rowcache (cold path; see interp). Kept last: appending preserves the
-    // hot variants' discriminants.
+    // field back to `out`. `cache` is C's d.fieldselect.rowcache. Kept last:
+    // appending preserves the hot variants' discriminants.
     FieldSelect {
         fieldnum: i16,
         resulttype: Oid,
         frame: u32,
+        cache: NonNull<FieldSelectCache>,
         out: OutRef,
     },
     // C EEOP_ROWCOMPARE_STEP: per-column btree ORDER proc; strict-NULL input
@@ -899,6 +899,22 @@ pub struct JsonConstructorState {
     pub types: NonNull<Oid>,
     pub scalar_json: Option<NonNull<::adt_json::tojson::TypeCat>>,
     pub scalar_jsonb: Option<NonNull<::adt_jsonb::tojsonb::ValCategory>>,
+}
+
+// C ExprEvalStep d.fieldselect.rowcache (ExprEvalRowtypeCache,
+// get_cached_rowtype). Named-composite leg: `entry` points at the typcache
+// entry (C rowcache.cacheptr) and `tupdesc_id` holds its tupDesc_identifier
+// when cached; the descriptor is re-read from the entry on every eval, so no
+// descriptor is pinned across evals. RECORD leg: `record_desc` is a copy of
+// the blessed descriptor for `record_typmod`, allocated in `mcx` (the compile
+// mcx restamped 'static; it outlives every eval of this step).
+pub struct FieldSelectCache {
+    pub named_type: Oid,
+    pub entry: Option<NonNull<::typcache::TypeCacheEntry>>,
+    pub tupdesc_id: u64,
+    pub record_typmod: i32,
+    pub record_desc: Option<NonNull<::types_tuple::TupleDescData<'static>>>,
+    pub mcx: Mcx<'static>,
 }
 
 // C ExprEvalStep d.nulltest_row.rowcache: last-seen rowtype's tupdesc,

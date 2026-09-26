@@ -2907,6 +2907,19 @@ pub(crate) fn init_expr_rec<'mcx>(
                     .try_reserve(1)
                     .map_err(|_| mcx.oom(core::mem::size_of::<FuncFrame<'_>>()))?;
                 state.frames.push(frame);
+                let cache = alloc_state(
+                    mcx,
+                    crate::steps::FieldSelectCache {
+                        named_type: ::types_core::InvalidOid,
+                        entry: None,
+                        tupdesc_id: 0,
+                        record_typmod: -1,
+                        record_desc: None,
+                        // SAFETY: the compile mcx outlives every eval of this
+                        // step (RowNullState restamp shape).
+                        mcx: unsafe { core::mem::transmute::<Mcx<'mcx>, Mcx<'static>>(mcx) },
+                    },
+                )?;
                 push_step(
                     state,
                     mcx,
@@ -2914,6 +2927,7 @@ pub(crate) fn init_expr_rec<'mcx>(
                         fieldnum: f.fieldnum,
                         resulttype: f.resulttype,
                         frame: frame_ix,
+                        cache,
                         out,
                     },
                 )

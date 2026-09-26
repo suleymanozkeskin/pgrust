@@ -1,0 +1,168 @@
+--
+-- Field selection from composite values (FieldSelect): results must not
+-- depend on whether the row type's descriptor is cached in the expression.
+--
+-- Named composite: a table row type with mixed fixed-length and varlena
+-- columns, expanded field by field over many rows.
+CREATE TABLE fsr_wide (
+    id integer PRIMARY KEY,
+    t1 text, i1 bigint, b1 bytea, ts timestamptz, flag boolean, u uuid, t2 text
+);
+INSERT INTO fsr_wide
+SELECT g, 'text-' || g, g * 7, decode(md5(g::text), 'hex'),
+       TIMESTAMPTZ '2026-01-01 00:00:00+00' + g * INTERVAL '1 minute',
+       g % 2 = 0, md5(g::text)::uuid, repeat('x', g % 5)
+FROM generate_series(1, 20) g;
+SELECT (w).id, (w).t1, (w).i1, (w).b1, (w).flag, (w).t2
+FROM (SELECT w FROM fsr_wide w ORDER BY id) s
+WHERE (w).id <= 3;
+ id |   t1   | i1 |                 b1                 | flag | t2  
+----+--------+----+------------------------------------+------+-----
+  1 | text-1 |  7 | \xc4ca4238a0b923820dcc509a6f75849b | f    | x
+  2 | text-2 | 14 | \xc81e728d9d4c2f636f067f89cc14862c | t    | xx
+  3 | text-3 | 21 | \xeccbc87e4b5ce2fe28308fd9f2a7baf3 | f    | xxx
+(3 rows)
+
+SELECT sum((w).i1), count((w).t2), string_agg((w).t1, ',' ORDER BY (w).id)
+FROM (SELECT w FROM fsr_wide w) s;
+ sum  | count |                                                                       string_agg                                                                       
+------+-------+--------------------------------------------------------------------------------------------------------------------------------------------------------
+ 1470 |    20 | text-1,text-2,text-3,text-4,text-5,text-6,text-7,text-8,text-9,text-10,text-11,text-12,text-13,text-14,text-15,text-16,text-17,text-18,text-19,text-20
+(1 row)
+
+-- A composite returned by a PL/pgSQL function and expanded with (d.r).*.
+CREATE FUNCTION fsr_get(p integer) RETURNS TABLE(location text, r fsr_wide)
+LANGUAGE plpgsql STABLE AS $$
+DECLARE v fsr_wide%ROWTYPE;
+BEGIN
+    SELECT w.* INTO v FROM fsr_wide w WHERE w.id = p;
+    RETURN QUERY SELECT 'HISTORY'::text, v;
+END $$;
+SELECT location, (d.r).* FROM fsr_get(4) AS d;
+ location | id |   t1   | i1 |                 b1                 |              ts              | flag |                  u                   |  t2  
+----------+----+--------+----+------------------------------------+------------------------------+------+--------------------------------------+------
+ HISTORY  |  4 | text-4 | 28 | \xa87ff679a2f3e71d9181a67b7542122c | Wed Dec 31 16:04:00 2025 PST | t    | a87ff679-a2f3-e71d-9181-a67b7542122c | xxxx
+(1 row)
+
+SELECT (d.r).id, (d.r).t1 FROM generate_series(1, 5) g, LATERAL fsr_get(g) AS d ORDER BY 1;
+ id |   t1   
+----+--------
+  1 | text-1
+  2 | text-2
+  3 | text-3
+  4 | text-4
+  5 | text-5
+(5 rows)
+
+-- The same prepared statement across row-type changes (its selected fields
+-- survive every change), and the full expansion after each change.
+PREPARE fsr_prep(integer) AS
+    SELECT (w).id, (w).flag, (w).t2 FROM (SELECT w FROM fsr_wide w WHERE id = $1) s;
+EXECUTE fsr_prep(2);
+ id | flag | t2 
+----+------+----
+  2 | t    | xx
+(1 row)
+
+SELECT (w).* FROM (SELECT w FROM fsr_wide w WHERE id = 2) s;
+ id |   t1   | i1 |                 b1                 |              ts              | flag |                  u                   | t2 
+----+--------+----+------------------------------------+------------------------------+------+--------------------------------------+----
+  2 | text-2 | 14 | \xc81e728d9d4c2f636f067f89cc14862c | Wed Dec 31 16:02:00 2025 PST | t    | c81e728d-9d4c-2f63-6f06-7f89cc14862c | xx
+(1 row)
+
+ALTER TABLE fsr_wide ADD COLUMN extra integer DEFAULT 42;
+EXECUTE fsr_prep(2);
+ id | flag | t2 
+----+------+----
+  2 | t    | xx
+(1 row)
+
+SELECT (w).* FROM (SELECT w FROM fsr_wide w WHERE id = 2) s;
+ id |   t1   | i1 |                 b1                 |              ts              | flag |                  u                   | t2 | extra 
+----+--------+----+------------------------------------+------------------------------+------+--------------------------------------+----+-------
+  2 | text-2 | 14 | \xc81e728d9d4c2f636f067f89cc14862c | Wed Dec 31 16:02:00 2025 PST | t    | c81e728d-9d4c-2f63-6f06-7f89cc14862c | xx |    42
+(1 row)
+
+ALTER TABLE fsr_wide DROP COLUMN t1;
+EXECUTE fsr_prep(2);
+ id | flag | t2 
+----+------+----
+  2 | t    | xx
+(1 row)
+
+SELECT (w).* FROM (SELECT w FROM fsr_wide w WHERE id = 2) s;
+ id | i1 |                 b1                 |              ts              | flag |                  u                   | t2 | extra 
+----+----+------------------------------------+------------------------------+------+--------------------------------------+----+-------
+  2 | 14 | \xc81e728d9d4c2f636f067f89cc14862c | Wed Dec 31 16:02:00 2025 PST | t    | c81e728d-9d4c-2f63-6f06-7f89cc14862c | xx |    42
+(1 row)
+
+ALTER TABLE fsr_wide ALTER COLUMN i1 TYPE numeric;
+EXECUTE fsr_prep(2);
+ id | flag | t2 
+----+------+----
+  2 | t    | xx
+(1 row)
+
+SELECT (w).* FROM (SELECT w FROM fsr_wide w WHERE id = 2) s;
+ id | i1 |                 b1                 |              ts              | flag |                  u                   | t2 | extra 
+----+----+------------------------------------+------------------------------+------+--------------------------------------+----+-------
+  2 | 14 | \xc81e728d9d4c2f636f067f89cc14862c | Wed Dec 31 16:02:00 2025 PST | t    | c81e728d-9d4c-2f63-6f06-7f89cc14862c | xx |    42
+(1 row)
+
+DEALLOCATE fsr_prep;
+SELECT location, (d.r).* FROM fsr_get(5) AS d;
+ location | id | i1 |                 b1                 |              ts              | flag |                  u                   | t2 | extra 
+----------+----+----+------------------------------------+------------------------------+------+--------------------------------------+----+-------
+ HISTORY  |  5 | 35 | \xe4da3b7fbbce2345d7772b0674a318d5 | Wed Dec 31 16:05:00 2025 PST | f    | e4da3b7f-bbce-2345-d777-2b0674a318d5 |    |    42
+(1 row)
+
+-- Anonymous records (RECORD with a blessed descriptor).
+SELECT (x).f1, (x).f2
+FROM (SELECT ROW(g, 'r' || g) AS x FROM generate_series(1, 3) g) s(x)
+ORDER BY 1;
+ f1 | f2 
+----+----
+  1 | r1
+  2 | r2
+  3 | r3
+(3 rows)
+
+SELECT (y).*
+FROM (SELECT ROW(1, 'a'::text, 2.5::numeric) AS y) s;
+ f1 | f2 | f3  
+----+----+-----
+  1 | a  | 2.5
+(1 row)
+
+-- Domain over a composite type.
+CREATE TYPE fsr_pair AS (lo integer, hi integer);
+CREATE DOMAIN fsr_ordered AS fsr_pair CHECK ((VALUE).lo <= (VALUE).hi);
+SELECT ((ROW(g, g + 1)::fsr_pair)::fsr_ordered).hi FROM generate_series(1, 3) g;
+ hi 
+----
+  2
+  3
+  4
+(3 rows)
+
+SELECT ((ROW(3, 1)::fsr_pair)::fsr_ordered).lo;
+ERROR:  value for domain fsr_ordered violates check constraint "fsr_ordered_check"
+-- NULL composites and NULL fields.
+SELECT (w).id IS NULL AS id_null, (w).t2 IS NULL AS t2_null
+FROM (SELECT NULL::fsr_wide AS w) s;
+ id_null | t2_null 
+---------+---------
+ t       | t
+(1 row)
+
+SELECT (p).lo, (p).hi FROM (VALUES (ROW(1, NULL)::fsr_pair), (NULL::fsr_pair)) v(p);
+ lo | hi 
+----+----
+  1 |   
+    |   
+(2 rows)
+
+DROP FUNCTION fsr_get(integer);
+DROP DOMAIN fsr_ordered;
+DROP TYPE fsr_pair;
+DROP TABLE fsr_wide;
