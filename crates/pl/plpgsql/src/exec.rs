@@ -373,6 +373,7 @@ impl RecSysAttrs {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
 pub enum RecFieldRef {
     User(usize),
     Sys(&'static types_tuple::FormData_pg_attribute),
@@ -1979,7 +1980,7 @@ impl<'a> Estate<'a> {
             self.instantiate_empty_rec(f.recparentno)?;
         }
         if let DatumVal::Rec(Some(rv)) = &self.datums[f.recparentno as usize] {
-            match rec_lookup_field(&rv.desc, &f.fieldname) {
+            match f.lookup.find(&rv.desc, &f.fieldname) {
                 Some(RecFieldRef::User(i)) => {
                     return Ok(Some((rv.desc.types[i], rv.desc.typmods[i], rv.desc.colls[i])));
                 }
@@ -2052,7 +2053,7 @@ impl<'a> Estate<'a> {
                     self.instantiate_empty_rec(f.recparentno)?;
                 }
                 if let DatumVal::Rec(Some(rv)) = &self.datums[f.recparentno as usize] {
-                    let found = rec_lookup_field(&rv.desc, &f.fieldname);
+                    let found = f.lookup.find(&rv.desc, &f.fieldname);
                     if let Some(found) = found {
                         let (current, fetched) = match found {
                             RecFieldRef::User(i) => (rv.desc.types[i], (rv.values[i], rv.nulls[i])),
@@ -3649,7 +3650,7 @@ impl<'a> Estate<'a> {
                 let DatumVal::Rec(Some(rv)) = &self.datums[recno as usize] else {
                     panic!("plpgsql exec_assign_value: rec \"{recname}\" valueless after instantiate");
                 };
-                let i = match rec_lookup_field(&rv.desc, &f.fieldname) {
+                let i = match f.lookup.find(&rv.desc, &f.fieldname) {
                     Some(RecFieldRef::User(i)) => i,
                     Some(RecFieldRef::Sys(_)) => {
                         return Err(exec_err(
@@ -6611,6 +6612,7 @@ pub(crate) mod cfi_tests {
                 dno,
                 recparentno: 0,
                 fieldname: name.into(),
+                lookup: Default::default(),
             }));
         }
         let mut estate = Estate::new(&func, false, true);
@@ -6675,7 +6677,7 @@ pub(crate) mod cfi_tests {
         }
         let fields = [(2, 1, "ctid"), (3, 1, "tableoid"), (4, 0, "f1"), (5, 0, "ctid")];
         for (dno, recparentno, name) in fields {
-            func.datums.push(PlDatum::RecField(PlRecField { dno, recparentno, fieldname: name.into() }));
+            func.datums.push(PlDatum::RecField(PlRecField { dno, recparentno, fieldname: name.into(), lookup: Default::default() }));
         }
         let mut estate = Estate::new(&func, false, true);
         let mcx = estate.datum_mcx();
@@ -7113,7 +7115,7 @@ mod param_fetch_tests {
                 notnull: false,
                 default_val: None,
             }),
-            PlDatum::RecField(PlRecField { dno: 1, recparentno: 0, fieldname: "a".into() }),
+            PlDatum::RecField(PlRecField { dno: 1, recparentno: 0, fieldname: "a".into(), lookup: Default::default() }),
         ];
         let mut estate = Estate::new(&func, false, true);
         let expr = PlExpr {
