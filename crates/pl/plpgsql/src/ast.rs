@@ -540,4 +540,16 @@ pub struct PlFunction {
     pub nstatements: u32,
     /// Every expr's id (exec-side plan-table cleanup on recompile).
     pub expr_ids: Vec<u32>,
+    // The row shape of the last relation this trigger function ran for
+    // (see TriggerRowShape); unused for other functions.
+    pub trigger_shape: RefCell<Option<TriggerRowShape>>,
+}
+
+// The RecDesc of a trigger relation's row type with its stored-generated
+// column flags, reused while the relation's descriptor still matches
+// (RecDesc::matches_tupdesc).
+#[derive(Debug, Clone)]
+pub struct TriggerRowShape {
+    pub desc: Rc<crate::exec::RecDesc>,
+    pub generated: Rc<[bool]>,
 }
