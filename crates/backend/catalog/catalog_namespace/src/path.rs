@@ -549,23 +549,35 @@ pub fn CopySearchPathMatcher<'mcx>(
 }
 
 pub fn SearchPathMatchesCurrentEnvironment(path: &mut SearchPathMatcher<'_>) -> PgResult<bool> {
+    SearchPathMatchesSchemas(&path.schemas, path.addCatalog, path.addTemp, &mut path.generation)
+}
+
+// SearchPathMatchesCurrentEnvironment over the matcher's parts, for callers
+// that keep the schema list outside a memory context. On a match, `generation`
+// is set to the active path generation so the next check takes the fast path.
+pub fn SearchPathMatchesSchemas(
+    schemas: &[Oid],
+    addCatalog: bool,
+    addTemp: bool,
+    generation: &mut u64,
+) -> PgResult<bool> {
     recomputeNamespacePath()?;
 
-    let generation = ACTIVE_PATH_GENERATION.with(Cell::get);
-    if path.generation == generation {
+    let active_generation = ACTIVE_PATH_GENERATION.with(Cell::get);
+    if *generation == active_generation {
         return Ok(true);
     }
 
     let matches = with_path(|active| {
         let mut lc = 0;
-        if path.addTemp {
+        if addTemp {
             if lc < active.len() && active[lc] == MY_TEMP_NAMESPACE.with(Cell::get) {
                 lc += 1;
             } else {
                 return false;
             }
         }
-        if path.addCatalog {
+        if addCatalog {
             if lc < active.len() && active[lc] == PG_CATALOG_NAMESPACE {
                 lc += 1;
             } else {
@@ -576,7 +588,7 @@ pub fn SearchPathMatchesCurrentEnvironment(path: &mut SearchPathMatcher<'_>) -> 
         if BASE_CREATION_NAMESPACE.with(Cell::get) != cur {
             return false;
         }
-        for &sch in path.schemas.iter() {
+        for &sch in schemas {
             if lc < active.len() && active[lc] == sch {
                 lc += 1;
             } else {
@@ -589,6 +601,6 @@ pub fn SearchPathMatchesCurrentEnvironment(path: &mut SearchPathMatcher<'_>) -> 
         return Ok(false);
     }
 
-    path.generation = generation;
+    *generation = active_generation;
     Ok(true)
 }
