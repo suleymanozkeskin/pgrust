@@ -171,7 +171,7 @@ fn cursor_open_internal(
         };
 
         let query_string = plancache::CachedPlanQueryString(psrc);
-        errctx.set_query(query_string);
+        errctx.set_source_query(query_string);
 
         let params = cursor_params(&portal, &state.argtypes, values, nulls, params_hooked)?;
 
