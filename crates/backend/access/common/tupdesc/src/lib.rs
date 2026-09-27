@@ -110,6 +110,21 @@ pub fn CreateTupleDescTruncatedCopy<'mcx>(
     Ok(desc)
 }
 
+/// True when `copy` equals what CreateTupleDescCopy(`src`) would build: the
+/// same row type and attributes, with the constraint fields that the copy
+/// clears ignored. Lets a caller reuse an earlier copy of an equal descriptor.
+pub fn TupleDescMatchesCopy(copy: &TupleDescData<'_>, src: &TupleDescData<'_>) -> bool {
+    copy.natts == src.natts
+        && copy.tdtypeid == src.tdtypeid
+        && copy.tdtypmod == src.tdtypmod
+        && copy.attrs.len() == src.attrs.len()
+        && copy.attrs.iter().zip(src.attrs.iter()).all(|(c, s)| {
+            let mut s = *s;
+            clear_constraint_fields(&mut s);
+            *c == s
+        })
+}
+
 pub fn CreateTupleDescCopyConstr<'mcx>(
     mcx: Mcx<'mcx>,
     tupdesc: &TupleDescData<'_>,
