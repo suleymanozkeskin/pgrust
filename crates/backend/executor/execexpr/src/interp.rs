@@ -1354,12 +1354,13 @@ fn run_program<'mcx>(
                 fieldnum,
                 resulttype,
                 frame,
+                cache,
                 out,
             } => {
                 let r = read_out(*out);
                 if !r.isnull {
                     let (value, isnull) =
-                        eval_field_select(frames, *fieldnum, *resulttype, *frame, r.value)?;
+                        eval_field_select(frames, *fieldnum, *resulttype, *frame, *cache, r.value)?;
                     write_out(*out, value, isnull);
                 }
             }
@@ -3133,16 +3134,83 @@ fn varlena_datum(v: ::datum::Varlena<'_>) -> Datum {
     image_datum(v.into_image())
 }
 
+// get_cached_rowtype (execExprInterp.c), named-composite leg: reuse the
+// cached typcache entry while its tupDesc_identifier is unchanged; look the
+// type up again on first use, on a type change, or after an invalidation
+// (which resets the identifier to 0). Returns a counted reference for the
+// duration of one eval; nothing is pinned across evals.
+fn field_select_named_rowtype(
+    cache: &mut crate::steps::FieldSelectCache,
+    tup_type: ::types_core::Oid,
+) -> PgResult<std::rc::Rc<::types_tuple::TupleDescData<'static>>> {
+    let current = cache.entry.filter(|_| cache.named_type == tup_type && cache.tupdesc_id != 0);
+    // SAFETY: typcache entries are never removed from the backend's type
+    // cache (C: TypeCacheHash entries live for the backend), and a compiled
+    // expression does not outlive its backend.
+    let valid = current.filter(|e| unsafe { e.as_ref() }.tupdesc_identifier() == cache.tupdesc_id);
+    let entry = match valid {
+        Some(e) => e,
+        None => {
+            let e = ::typcache::lookup_type_cache(tup_type, ::typcache::TYPECACHE_TUPDESC)?;
+            let ptr = core::ptr::NonNull::from(&*e);
+            cache.entry = Some(ptr);
+            cache.named_type = tup_type;
+            cache.tupdesc_id = e.tupdesc_identifier();
+            ptr
+        }
+    };
+    // SAFETY: as above.
+    match unsafe { entry.as_ref() }.tupdesc() {
+        Some(td) => Ok(td),
+        None => {
+            let name = format_type::format_type_be(tup_type).unwrap_or_else(|_| format!("{tup_type}"));
+            Err(::types_error::PgError::error(format!("type {name} is not composite"))
+                .with_sqlstate(::types_error::ERRCODE_WRONG_OBJECT_TYPE)
+                .into())
+        }
+    }
+}
+
+// get_cached_rowtype, RECORD leg: a blessed descriptor is fixed for its
+// typmod in a backend, so one copy per typmod is kept in the cache's mcx.
+fn field_select_record_rowtype(
+    cache: &mut crate::steps::FieldSelectCache,
+    typmod: i32,
+) -> PgResult<&'static ::types_tuple::TupleDescData<'static>> {
+    if cache.record_desc.is_none() || cache.record_typmod != typmod {
+        use ::mcx::Allocator;
+        let desc = ::typcache::lookup_rowtype_tupdesc_copy(cache.mcx, ::types_core::catalog::RECORDOID, typmod)?;
+        let layout = core::alloc::Layout::new::<::types_tuple::TupleDescData<'static>>();
+        let ptr: core::ptr::NonNull<::types_tuple::TupleDescData<'static>> = cache
+            .mcx
+            .allocate(layout)
+            .map_err(|_| cache.mcx.oom(layout.size()))?
+            .cast();
+        // SAFETY: fresh exact-layout allocation; the descriptor's referents
+        // live in cache.mcx, which outlives every eval of this step.
+        unsafe {
+            ptr.as_ptr().write(core::mem::transmute::<
+                ::types_tuple::TupleDescData<'_>,
+                ::types_tuple::TupleDescData<'static>,
+            >(desc));
+        }
+        cache.record_desc = Some(ptr);
+        cache.record_typmod = typmod;
+    }
+    // SAFETY: cache.mcx-allocated descriptor, live for the plan.
+    Ok(unsafe { cache.record_desc.expect("set above").as_ref() })
+}
+
 // ExecEvalFieldSelect (execExprInterp.c), heap-composite leg; the expanded-
-// record fastpath is unported loud. C memoizes the tupdesc in the step's
-// rowcache; a per-eval registry copy stands in (cold path, no invalidation).
+// record fastpath is unported loud. The tupdesc comes from the step's
+// rowcache (field_select_rowtype, C get_cached_rowtype).
 #[inline(never)]
-#[cold]
 fn eval_field_select(
     frames: &mut [crate::steps::FuncFrame<'_>],
     fieldnum: i16,
     resulttype: ::types_core::Oid,
     frame: u32,
+    cache: core::ptr::NonNull<crate::steps::FieldSelectCache>,
     value: Datum,
 ) -> PgResult<(Datum, bool)> {
     use ::types_tuple::{HeapTupleData, HeapTupleHeaderData, ItemPointerData};
@@ -3175,7 +3243,16 @@ fn eval_field_select(
     };
     // SAFETY: detoasted composite image; header prefix is in bounds.
     let hdr = unsafe { &*(rec.as_ptr() as *const HeapTupleHeaderData) };
-    let tupdesc = ::typcache::lookup_rowtype_tupdesc_copy(mcx, hdr.type_id(), hdr.typmod())?;
+    // SAFETY: compile-allocated state, single-threaded interpreter.
+    let cache = unsafe { &mut *cache.as_ptr() };
+    let named;
+    let tupdesc: &::types_tuple::TupleDescData<'_> = match hdr.type_id() {
+        ::types_core::catalog::RECORDOID => field_select_record_rowtype(cache, hdr.typmod())?,
+        tup_type => {
+            named = field_select_named_rowtype(cache, tup_type)?;
+            &named
+        }
+    };
     // C ExecEvalFieldSelect (execExprInterp.c:3770-3792), heap-composite leg.
     if fieldnum <= 0 {
         return Err(::types_error::PgError::error(format!(
@@ -5254,12 +5331,13 @@ pub(crate) fn exec_one_step<'mcx>(
             fieldnum,
             resulttype,
             frame,
+            cache,
             out,
         } => {
             let r = read_out(out);
             if !r.isnull {
                 let (value, isnull) =
-                    eval_field_select(frames, fieldnum, resulttype, frame, r.value)?;
+                    eval_field_select(frames, fieldnum, resulttype, frame, cache, r.value)?;
                 write_out(out, value, isnull);
             }
         }
