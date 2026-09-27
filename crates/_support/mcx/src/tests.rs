@@ -160,6 +160,24 @@ fn aset_reset_returns_charged_bytes_to_zero() {
     assert_eq!(ctx.used(), 0);
 }
 
+// A root wholesale AllocSet (new_wholesale) is reset with bytes still
+// charged, like C's AllocSetReset, without the leak check firing; it then
+// accounts from zero and can be reused.
+#[test]
+fn wholesale_root_resets_with_charged_bytes() {
+    let mut ctx = MemoryContext::new_wholesale("t");
+    let v: PgVec<u8> = vec_with_capacity_in(ctx.mcx(), 4096).unwrap();
+    assert_eq!(ctx.used(), 4096);
+    core::mem::forget(v);
+    ctx.reset();
+    assert_eq!(ctx.used(), 0);
+    assert_eq!(ctx.peak(), 0);
+    let w: PgVec<u8> = vec_with_capacity_in(ctx.mcx(), 64).unwrap();
+    assert_eq!(ctx.used(), 64);
+    drop(w);
+    assert_eq!(ctx.used(), 0);
+}
+
 #[test]
 fn reset_callbacks_fire_lifo_on_reset_and_drop() {
     use core::cell::RefCell;
