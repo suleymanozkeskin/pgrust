@@ -831,3 +831,56 @@ fn extensible_node_read_arm_matches_c() {
     assert_elog("{EXTENSIBLENODE :extnodename", "extnodename has to be supplied");
     assert_elog("{EXTENSIBLENODE", "extnodename has to be supplied");
 }
+
+// pg_strtok (read.c) written as a direct loop over the input: the reference
+// that Reader::next_token must match token for token.
+fn pg_strtok_reference(buf: &[u8]) -> Vec<Vec<u8>> {
+    let is_space = |c: u8| c == b' ' || c == b'\n' || c == b'\t';
+    let is_special = |c: u8| b"(){}".contains(&c);
+    let mut tokens = Vec::new();
+    let mut pos = 0;
+    loop {
+        while pos < buf.len() && is_space(buf[pos]) {
+            pos += 1;
+        }
+        if pos >= buf.len() {
+            return tokens;
+        }
+        let start = pos;
+        if is_special(buf[pos]) {
+            pos += 1;
+        } else {
+            while pos < buf.len() && !is_space(buf[pos]) && !is_special(buf[pos]) {
+                pos += if buf[pos] == b'\\' && pos + 1 < buf.len() { 2 } else { 1 };
+            }
+        }
+        let tok = &buf[start..pos];
+        tokens.push(if tok == b"<>" { Vec::new() } else { tok.to_vec() });
+    }
+}
+
+#[test]
+fn next_token_matches_pg_strtok() {
+    let ctx = MemoryContext::new("t");
+    let inputs: &[&[u8]] = &[
+        b"",
+        b"   \n\t ",
+        b"({QUERY :a 1 :b <> :c (b 8 9)})",
+        b"<> <><> \"<>\"",
+        b"abc\\ def \\(x\\) \\{\\} end",
+        b"\\",
+        b"x\\",
+        b"\\\\ \\ \\\n",
+        b"(((a)))}{",
+        b":name \"quoted \\\" text\" :n -12",
+        b"trailing-space ",
+    ];
+    for input in inputs {
+        let mut reader = crate::Reader { mcx: ctx.mcx(), buf: input, pos: 0, tok_start: 0 };
+        let mut got = Vec::new();
+        while let Some(tok) = reader.next_token() {
+            got.push(tok.to_vec());
+        }
+        assert_eq!(got, pg_strtok_reference(input), "input {:?}", String::from_utf8_lossy(input));
+    }
+}

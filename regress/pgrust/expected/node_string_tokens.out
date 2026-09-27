@@ -1,0 +1,97 @@
+--
+-- Stored expressions (CHECK constraints, column defaults, views, rules) are
+-- read back from node strings. Constants that contain the node string's
+-- special bytes must come back unchanged.
+--
+CREATE TABLE nst_t (
+    id integer,
+    a text DEFAULT '{(a)} \ <> "q" \\ end',
+    b text DEFAULT E'tab\there\nnewline',
+    c text CHECK (c <> '(){}' AND c <> '\' AND c <> '<>'),
+    d text CHECK (d IS NULL OR d NOT LIKE '%\{%' ESCAPE '!'),
+    e integer CHECK (e BETWEEN -12 AND 12)
+);
+INSERT INTO nst_t (id, c, d, e) VALUES (1, 'x', 'y', 5);
+INSERT INTO nst_t (id, c, d, e) VALUES (2, '(){}x', NULL, -12);
+INSERT INTO nst_t (id, c) VALUES (3, '(){}');
+ERROR:  new row for relation "nst_t" violates check constraint "nst_t_c_check"
+DETAIL:  Failing row contains (3, {(a)} \ <> "q" \\ end, tab	here
+newline, (){}, null, null).
+INSERT INTO nst_t (id, c) VALUES (4, '\');
+ERROR:  new row for relation "nst_t" violates check constraint "nst_t_c_check"
+DETAIL:  Failing row contains (4, {(a)} \ <> "q" \\ end, tab	here
+newline, \, null, null).
+INSERT INTO nst_t (id, c) VALUES (5, '<>');
+ERROR:  new row for relation "nst_t" violates check constraint "nst_t_c_check"
+DETAIL:  Failing row contains (5, {(a)} \ <> "q" \\ end, tab	here
+newline, <>, null, null).
+INSERT INTO nst_t (id, d) VALUES (6, 'a\{b');
+ERROR:  new row for relation "nst_t" violates check constraint "nst_t_d_check"
+DETAIL:  Failing row contains (6, {(a)} \ <> "q" \\ end, tab	here
+newline, null, a\{b, null).
+INSERT INTO nst_t (id, e) VALUES (7, 13);
+ERROR:  new row for relation "nst_t" violates check constraint "nst_t_e_check"
+DETAIL:  Failing row contains (7, {(a)} \ <> "q" \\ end, tab	here
+newline, null, null, 13).
+SELECT id, a, b, c, d, e FROM nst_t ORDER BY id;
+ id |           a           |      b       |   c   | d |  e  
+----+-----------------------+--------------+-------+---+-----
+  1 | {(a)} \ <> "q" \\ end | tab     here+| x     | y |   5
+    |                       | newline      |       |   | 
+  2 | {(a)} \ <> "q" \\ end | tab     here+| (){}x |   | -12
+    |                       | newline      |       |   | 
+(2 rows)
+
+SELECT pg_get_expr(adbin, adrelid) FROM pg_attrdef
+WHERE adrelid = 'nst_t'::regclass ORDER BY adnum;
+          pg_get_expr          
+-------------------------------
+ '{(a)} \ <> "q" \\ end'::text
+ 'tab    here                 +
+ newline'::text
+(2 rows)
+
+SELECT conname, pg_get_constraintdef(oid) FROM pg_constraint
+WHERE conrelid = 'nst_t'::regclass ORDER BY conname;
+    conname    |                           pg_get_constraintdef                           
+---------------+--------------------------------------------------------------------------
+ nst_t_c_check | CHECK (((c <> '(){}'::text) AND (c <> '\'::text) AND (c <> '<>'::text)))
+ nst_t_d_check | CHECK (((d IS NULL) OR (d !~~ like_escape('%\{%'::text, '!'::text))))
+ nst_t_e_check | CHECK (((e >= '-12'::integer) AND (e <= 12)))
+(3 rows)
+
+CREATE VIEW nst_v AS
+SELECT id, a || '|{x}|' AS a2, c = '(){}' AS special, '\' || id::text AS back,
+       ARRAY['{', '}', '(', ')'] AS brackets
+FROM nst_t;
+SELECT * FROM nst_v ORDER BY id;
+ id |             a2             | special | back |   brackets    
+----+----------------------------+---------+------+---------------
+  1 | {(a)} \ <> "q" \\ end|{x}| | f       | \1   | {"{","}",(,)}
+  2 | {(a)} \ <> "q" \\ end|{x}| | f       | \2   | {"{","}",(,)}
+(2 rows)
+
+SELECT pg_get_viewdef('nst_v'::regclass, true);
+                          pg_get_viewdef                           
+-------------------------------------------------------------------
+  SELECT id,                                                      +
+     a || '|{x}|'::text AS a2,                                    +
+     c = '(){}'::text AS special,                                 +
+     '\'::text || id::text AS back,                               +
+     ARRAY['{'::text, '}'::text, '('::text, ')'::text] AS brackets+
+    FROM nst_t;
+(1 row)
+
+CREATE TABLE nst_log (note text);
+CREATE RULE nst_rule AS ON UPDATE TO nst_t
+    DO ALSO INSERT INTO nst_log VALUES ('updated {' || old.id || '} \ (' || new.c || ')');
+UPDATE nst_t SET c = 'new(){}' WHERE id = 1;
+SELECT * FROM nst_log;
+          note           
+-------------------------
+ updated {1} \ (new(){})
+(1 row)
+
+DROP RULE nst_rule ON nst_t;
+DROP VIEW nst_v;
+DROP TABLE nst_t, nst_log;
