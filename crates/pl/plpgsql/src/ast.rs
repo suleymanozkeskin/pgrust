@@ -132,6 +132,29 @@ pub struct PlRecField {
     pub dno: Dno,
     pub recparentno: Dno,
     pub fieldname: String,
+    pub lookup: RecFieldLookup,
+}
+
+// The field found for the last record descriptor this field was read from
+// (C: PLpgSQL_recfield.rectupledescid and finfo). The descriptor is held
+// weakly and compared by address; the weak reference keeps the address from
+// being reused while the entry exists.
+#[derive(Debug, Default)]
+pub struct RecFieldLookup(RefCell<Option<(Weak<crate::exec::RecDesc>, crate::exec::RecFieldRef)>>);
+
+impl RecFieldLookup {
+    // crate::exec::rec_lookup_field for `desc`, from the entry when it was
+    // made for the same descriptor. A missing field is not kept.
+    pub fn find(&self, desc: &Rc<crate::exec::RecDesc>, fieldname: &str) -> Option<crate::exec::RecFieldRef> {
+        if let Some((cached, found)) = &*self.0.borrow() {
+            if core::ptr::eq(cached.as_ptr(), Rc::as_ptr(desc)) {
+                return Some(*found);
+            }
+        }
+        let found = crate::exec::rec_lookup_field(desc, fieldname)?;
+        *self.0.borrow_mut() = Some((Rc::downgrade(desc), found));
+        Some(found)
+    }
 }
 
 #[derive(Debug)]
