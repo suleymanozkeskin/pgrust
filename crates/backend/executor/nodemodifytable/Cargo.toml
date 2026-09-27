@@ -23,6 +23,7 @@ types_slot = { path = "../../../_support/types/types_slot" }
 executils = { path = "../executils" }
 execexpr = { path = "../execexpr" }
 readfuncs = { path = "../../nodes/readfuncs" }
+copyfuncs = { path = "../../nodes/copyfuncs" }
 lsyscache = { path = "../../utils/cache/lsyscache" }
 format_type = { path = "../../utils/adt/format_type" }
 vars = { path = "../../optimizer/util/vars" }
